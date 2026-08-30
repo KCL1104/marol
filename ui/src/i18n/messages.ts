@@ -375,6 +375,7 @@ export const en = {
   'inspector.worktreeGroup': 'worktree',
   'inspector.shell': 'shell',
   'inspector.queued': 'A message will send when this turn ends',
+  'inspector.queuedFrom': '{who} is waiting for this turn to end',
   'timeline.waited': '· held {for}',
 
   /* ----------------------------- review ------------------------------- */
@@ -911,6 +912,7 @@ export const zhTW: Record<MessageKey, string> = {
   'inspector.worktreeGroup': 'worktree',
   'inspector.shell': 'shell',
   'inspector.queued': '一則訊息會在這個回合結束後送出',
+  'inspector.queuedFrom': '{who} 正在等這個回合結束',
   'timeline.waited': '· 等候 {for}',
 
   /* ----------------------------- review ------------------------------- */

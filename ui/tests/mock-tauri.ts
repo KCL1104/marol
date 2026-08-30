@@ -19,6 +19,9 @@ export interface MockSession {
   live: boolean;
   reports_status: boolean;
   hooks_wired: boolean;
+  /** Who has a message waiting for this session's turn to end. Absent is the
+   *  ordinary case; a person's own note leaves it empty. */
+  pending_from?: string[];
   /** The $MAROL_PORT a run script was handed, when reachable. */
   preview_port: number | null;
   /** The conversation's token account — tests seed it, the core computes it. */

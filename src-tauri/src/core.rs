@@ -156,6 +156,12 @@ pub struct SessionMeta {
     /// A message is queued to go in when this turn ends. Transient, like
     /// the PTY it waits on — never stored, false on every restore.
     pub has_followup: bool,
+    /// Who has a message waiting for this session's turn to end, distinct and
+    /// in arrival order. Empty when the only thing queued is the person's own
+    /// follow-up — which is the difference the drawer has to show, because
+    /// "you left a note here" and "two other agents are waiting on this one"
+    /// are not the same fact and were rendered as the same sentence.
+    pub pending_from: Vec<String>,
     /// The `$MAROL_PORT` a run script was handed, when the app can
     /// reach it (local and WSL; an SSH host's port lives on the remote).
     /// Transient like the followup flag: the server dies with the PTY, and
@@ -378,6 +384,7 @@ impl SessionMeta {
             // one live again is `reopen_session`, which is the agent path.
             agent_session: true,
             has_followup: false,
+            pending_from: Vec::new(),
             preview_port: None,
             usage: None,
             transcript_path: None,
@@ -1189,6 +1196,27 @@ impl HookHandler for Router {
             .ok_or_else(|| "this desk is shutting down".to_string())?;
         core.enqueue_followup(to, text, Some(from))
             .map_err(|e| format!("{e:#}"))?;
+
+        // What the sender is doing, said the way the board already says it.
+        // A session posting to this endpoint is inside a shell tool, so its
+        // own PreToolUse reported `Bash` with a curl line — true, and useless
+        // on a card about which agents are talking to each other. Rewritten
+        // into the arrow shape `activity_from_payload` already gives Claude
+        // Code's own SendMessage, so the two channels read alike.
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            let to_title = sessions.get(to).map(|s| s.title.clone()).unwrap_or_default();
+            if let Some(sender) = sessions.get_mut(session_id) {
+                let what: String = text.chars().take(120).collect();
+                sender.activity = Some(Activity {
+                    tool: "SendMessage".to_string(),
+                    detail: format!("→ {to_title}: {what}").chars().take(160).collect(),
+                });
+                sender.activity_since = now_ms();
+            }
+        }
+        self.broadcast();
+
         if target_idle {
             core.flush_followup(to);
         }
@@ -2415,6 +2443,7 @@ impl Core {
             attempt_id: Some(attempt_id.clone()),
             agent_session: true,
             has_followup: false,
+            pending_from: Vec::new(),
             preview_port: None,
             usage: None,
             transcript_path: None,
@@ -2586,6 +2615,7 @@ impl Core {
             attempt_id: Some(attempt_id.to_string()),
             agent_session: true,
             has_followup: false,
+            pending_from: Vec::new(),
             preview_port: None,
             usage: None,
             transcript_path: None,
@@ -2934,6 +2964,7 @@ impl Core {
             // ending it with the desk is what it is for.
             agent_session: false,
             has_followup: false,
+            pending_from: Vec::new(),
             // Reachable worlds only: local directly, WSL through mirrored
             // networking. An SSH host's port lives on the remote, and a
             // recorded port nobody can dial would put a preview button on
@@ -3069,6 +3100,7 @@ impl Core {
             // And for the same reason, not held and not a loss on restart.
             agent_session: false,
             has_followup: false,
+            pending_from: Vec::new(),
             preview_port: None,
             usage: None,
             transcript_path: None,
@@ -3894,6 +3926,30 @@ impl Core {
         Ok(())
     }
 
+    /// Deliver text into a live session's terminal without recording it.
+    ///
+    /// The seam exists because the flush has a different record to write than
+    /// the send does: several messages leave as one paste, but they arrived
+    /// separately and from different people, and a timeline that folded them
+    /// into one row attributed to nobody would be a worse record than none.
+    /// So the flush composes the delivery here and writes its own rows.
+    fn deliver(&self, session_id: &str, text: &str) -> Result<()> {
+        let agent = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions
+                .get(session_id)
+                .ok_or_else(|| anyhow!("no such session: {session_id}"))?
+                .agent
+                .clone()
+        };
+        if prompt::delivery_for(&agent) != Delivery::Positional {
+            return Err(anyhow!(
+                "`{agent}`'s input conventions have not been measured; copy the text in instead"
+            ));
+        }
+        self.write(session_id, &prompt::bracketed_followup(text))
+    }
+
     /// The repository's branches, recency first, for the base picker.
     pub fn list_branches(&self, repo_path: &str) -> Result<Vec<String>> {
         let (loc, he) = self.located(repo_path)?;
@@ -3948,13 +4004,13 @@ impl Core {
                 from,
             });
         }
-        self.set_followup_flag(session_id, true);
+        self.refresh_pending(session_id);
         Ok(())
     }
 
     pub fn cancel_followup(&self, session_id: &str) {
         self.followups.lock().unwrap().remove(session_id);
-        self.set_followup_flag(session_id, false);
+        self.refresh_pending(session_id);
     }
 
     /// The Stop hook's half: the turn just ended, so what waited for it
@@ -3975,17 +4031,74 @@ impl Core {
             .map(Pending::rendered)
             .collect::<Vec<_>>()
             .join("\n\n");
-        if let Err(e) = self.send_followup(session_id, &text) {
+        if let Err(e) = self.deliver(session_id, &text) {
             // The session died between queue and Stop. The message is
-            // dropped rather than retried into a terminal that is gone.
+            // dropped rather than retried into a terminal that is gone, and
+            // nothing is recorded — the timeline says what an agent was
+            // asked, and this was not asked of anyone.
             eprintln!("[core] queued follow-up for {session_id} failed: {e:#}");
+            self.refresh_pending(session_id);
+            return;
         }
-        self.set_followup_flag(session_id, false);
+
+        // One row per message, each under its own author. A relayed message
+        // filed as a `prompt` would have the record claim the person said
+        // something they did not — the same lie the envelope exists to stop,
+        // told to whoever reads the timeline afterwards instead of to the
+        // agent. The stored text is what was actually said, not the framed
+        // delivery: the frame is how it travelled, not what it was.
+        let attempt_id = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .and_then(|s| s.attempt_id.clone());
+        if let Some(id) = attempt_id {
+            let at = now_ms();
+            for p in &pending {
+                match &p.from {
+                    Some(from) => {
+                        let _ = self.store.append_event(
+                            &id,
+                            at,
+                            "message",
+                            Some(from),
+                            Some(&p.text),
+                        );
+                    }
+                    None => {
+                        let _ = self.store.append_event(&id, at, "prompt", None, Some(&p.text));
+                    }
+                }
+            }
+        }
+        self.refresh_pending(session_id);
     }
 
-    fn set_followup_flag(&self, session_id: &str, value: bool) {
+    /// Re-read what is waiting for this session and put it on the row.
+    ///
+    /// Derived rather than told. The flag used to be set by hand at each of
+    /// the three places that touch the queue, which was survivable while it
+    /// was one boolean and one slot; with senders to name it would have been
+    /// three chances for the row to disagree with the queue.
+    fn refresh_pending(&self, session_id: &str) {
+        let (has, from) = match self.followups.lock().unwrap().get(session_id) {
+            Some(q) => {
+                let mut from: Vec<String> = Vec::new();
+                for p in q {
+                    if let Some(f) = &p.from {
+                        if !from.contains(f) {
+                            from.push(f.clone());
+                        }
+                    }
+                }
+                (!q.is_empty(), from)
+            }
+            None => (false, Vec::new()),
+        };
         if let Some(s) = self.sessions.lock().unwrap().get_mut(session_id) {
-            s.has_followup = value;
+            s.has_followup = has;
+            s.pending_from = from;
         }
         self.broadcast();
     }
@@ -4112,6 +4225,7 @@ impl Core {
             // and lost on the same terms as one with a card.
             agent_session: true,
             has_followup: false,
+            pending_from: Vec::new(),
             preview_port: None,
             usage: None,
             transcript_path: None,
@@ -6214,6 +6328,7 @@ mod tests {
             attempt_id: None,
             agent_session: true,
             has_followup: false,
+            pending_from: Vec::new(),
             preview_port: None,
             usage: None,
             transcript_path: None,

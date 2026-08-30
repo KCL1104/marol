@@ -87,8 +87,10 @@ export interface AttemptEvent {
   attempt_id: string;
   at: number;
   /** `prompt` — what it was asked. `tool` — what it reached for.
-      `status` — when it started waiting on you, or stopped. */
-  kind: 'prompt' | 'tool' | 'status' | string;
+      `status` — when it started waiting on you, or stopped.
+      `message` — what another session on this desk sent it, `tool` naming
+      which one. */
+  kind: 'prompt' | 'tool' | 'status' | 'message' | string;
   tool: string | null;
   detail: string | null;
 }
@@ -159,6 +161,10 @@ export interface SessionMeta {
   /** A message is queued to go in when this turn ends. Transient — never
       stored, absent from restores. */
   has_followup?: boolean;
+  /** Who has a message waiting for this session's turn to end. Empty when the
+      only thing queued is the person's own note — "you left a note here" and
+      "two other agents are waiting on this one" are different facts. */
+  pending_from?: string[];
   /** The $MAROL_PORT a run script was handed, when reachable from the
       app (local and WSL; an SSH host's port lives on the remote). Transient
       — the server dies with the PTY. */

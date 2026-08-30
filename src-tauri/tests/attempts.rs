@@ -1831,6 +1831,68 @@ fn a_codex_session_can_message_a_claude_session_and_it_arrives_marked() {
         stdin.contains("Port the tests"),
         "the frame does not name the sender: {stdin:?}"
     );
+
+    // And the record says who actually spoke. Filed as a `prompt` it would
+    // have the timeline claim the person said this — the same lie the frame
+    // stops in the terminal, told instead to whoever reads the record later.
+    // Found by kind rather than by position: the `idle` that drains the
+    // queue also writes a status row, both stamped the same millisecond from
+    // different threads, so "the last row" is a coin toss.
+    let rows = h.timeline(&a1.attempt_id, 2);
+    let msg = rows
+        .iter()
+        .find(|r| r.kind == "message")
+        .unwrap_or_else(|| panic!("no relayed-message row: {rows:?}"));
+    assert_eq!(msg.kind, "message", "a relayed message was filed as: {msg:?}");
+    // The sender's row name, which is the card title plus its attempt number
+    // — the name the person actually sees in the sidebar, not the card's.
+    assert_eq!(msg.tool.as_deref(), Some("Port the tests #1"), "{msg:?}");
+    // The stored text is what was said, not how it travelled: the frame is
+    // delivery, and a record of it would be a record of our own plumbing.
+    assert_eq!(msg.detail.as_deref(), Some("auth.py is mine — do not touch it"));
+    assert!(!msg.detail.as_deref().unwrap_or_default().contains("[marol]"));
+
+    // The sender's own card says whom it is talking to, in the shape the
+    // board already uses for Claude Code's native SendMessage.
+    let sender = h
+        .core
+        .sessions()
+        .into_iter()
+        .find(|s| s.id == a2.session_id)
+        .expect("the sending session");
+    let act = sender.activity.expect("the sender reports no activity");
+    assert_eq!(act.tool, "SendMessage");
+    assert!(act.detail.starts_with("→ Fix login"), "{:?}", act.detail);
+}
+
+/// A person's own follow-up is still the person's. The queue carries both
+/// kinds now, and the row each one leaves has to say which it was.
+#[test]
+fn a_persons_followup_is_still_recorded_as_a_prompt() {
+    let h = Harness::new("bridgemine");
+    let _guard = h.rt.enter();
+    let task = h.card("Fix login", "make it work");
+    let a = h.start(&task, "claude");
+    h.launches(&a.session_id, 1);
+
+    h.core.queue_followup(&a.session_id, "one more thing").expect("queue");
+    h.hook(&a.session_id, "idle", serde_json::json!({}));
+    h.stdin_when(&a.session_id, |s| s.contains("one more thing"));
+
+    let rows = h.timeline(&a.attempt_id, 2);
+    let note = rows
+        .iter()
+        .find(|r| r.detail.as_deref() == Some("one more thing"))
+        .unwrap_or_else(|| panic!("the note never reached the record: {rows:?}"));
+    assert_eq!(note.kind, "prompt", "the person's own note was reattributed: {note:?}");
+    assert_eq!(note.tool, None);
+    assert!(
+        !rows.iter().any(|r| r.kind == "message"),
+        "a person's note was filed as a relay: {rows:?}"
+    );
+    // And it wears no envelope — it *is* the person.
+    let stdin = h.stdin_when(&a.session_id, |s| s.contains("one more thing"));
+    assert!(!stdin.contains("[marol]"), "a person's note was framed as a relay: {stdin:?}");
 }
 
 /// The token is what turns `sid` from a guess into an identity. Without the
