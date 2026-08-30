@@ -165,6 +165,11 @@ export interface SessionMeta {
       only thing queued is the person's own note — "you left a note here" and
       "two other agents are waiting on this one" are different facts. */
   pending_from?: string[];
+  /** How far what this session was last told sits from the last thing a
+      person said, counted in agent-to-agent relays. Zero is a person —
+      typing into the terminal puts it back there. Transient, like the queue
+      it is counted from. */
+  relay_hops?: number;
   /** The $MAROL_PORT a run script was handed, when reachable from the
       app (local and WSL; an SSH host's port lives on the remote). Transient
       — the server dies with the PTY. */

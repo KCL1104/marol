@@ -376,6 +376,7 @@ export const en = {
   'inspector.shell': 'shell',
   'inspector.queued': 'A message will send when this turn ends',
   'inspector.queuedFrom': '{who} is waiting for this turn to end',
+  'inspector.relayed': '{n} relays since a person last said anything',
   'timeline.waited': '· held {for}',
 
   /* ----------------------------- review ------------------------------- */
@@ -913,6 +914,7 @@ export const zhTW: Record<MessageKey, string> = {
   'inspector.shell': 'shell',
   'inspector.queued': '一則訊息會在這個回合結束後送出',
   'inspector.queuedFrom': '{who} 正在等這個回合結束',
+  'inspector.relayed': '距離上一次有人說話，已經轉了 {n} 手',
   'timeline.waited': '· 等候 {for}',
 
   /* ----------------------------- review ------------------------------- */
