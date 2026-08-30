@@ -9,6 +9,8 @@
 
 use std::path::{Path, PathBuf};
 
+#[path = "../src/channel.rs"]
+mod channel;
 #[path = "../src/host.rs"]
 mod host;
 #[path = "../src/shell_env.rs"]
@@ -43,6 +45,8 @@ fn hr(env: &ShellEnv) -> HostRef<'_> {
         host: &LOCAL,
         local: env,
         env,
+        // Local, so there is no doorway and nothing to hold open.
+        channels: None,
     }
 }
 

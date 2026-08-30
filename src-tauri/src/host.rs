@@ -166,6 +166,16 @@ impl Host {
         (p, a)
     }
 
+    /// `wrap`, for a long-lived shell on pipes rather than a terminal.
+    ///
+    /// No `-t`, because there is no terminal on this side to give one and the
+    /// thing on the far end is reading a script; the environment still
+    /// crosses, because it is what the commands inside will resolve against.
+    pub fn wrap_channel(&self, program: &str, envs: &[(String, String)]) -> (String, Vec<String>) {
+        let (p, a, _) = self.wrap_inner(program, &[], None, envs, false);
+        (p, a)
+    }
+
     fn wrap_inner<'a>(
         &self,
         program: &str,
@@ -282,6 +292,30 @@ impl Host {
                 })
             }
         }
+    }
+}
+
+/// A channel's answer in the shape every caller here already reads.
+///
+/// `ExitStatus` cannot be built from a number in stable Rust, so the exit
+/// code rides through the platform's own encoding — the one place this file
+/// has to know that a status is a wait(2) word on unix and a plain code on
+/// Windows.
+fn as_output(a: crate::channel::Answer) -> std::process::Output {
+    #[cfg(unix)]
+    let status = {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(a.status << 8)
+    };
+    #[cfg(windows)]
+    let status = {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(a.status as u32)
+    };
+    std::process::Output {
+        status,
+        stdout: a.stdout,
+        stderr: a.stderr,
     }
 }
 
@@ -487,6 +521,10 @@ pub struct HostRef<'a> {
     pub host: &'a Host,
     pub local: &'a ShellEnv,
     pub env: &'a ShellEnv,
+    /// This world's held shells, when it has any. `None` is a world that
+    /// keeps none — every test that builds a `HostRef` by hand, and the local
+    /// host, which has no doorway to amortise.
+    pub channels: Option<&'a crate::channel::Channels>,
 }
 
 impl HostRef<'_> {
@@ -527,22 +565,35 @@ impl HostRef<'_> {
                 }
                 Ok(cmd.output()?)
             }
-            Host::Wsl { .. } => {
-                let carried = carried_with(self.env, extra);
-                let (_, wrapped, _) = self.host.wrap(program, &owned, cwd, &carried);
-                Ok(std::process::Command::new(wsl_exe(self.local))
-                    .args(wrapped)
-                    .output()?)
-            }
-            Host::Ssh { host } => {
-                let carried = carried_with(self.env, extra);
-                let mut a = ssh_base_args(false);
-                a.push("--".to_string());
-                a.push(host.clone());
-                a.push(remote_command(program, &owned, cwd, &carried));
-                Ok(std::process::Command::new(ssh_exe(self.local))
-                    .args(a)
-                    .output()?)
+            // Behind a doorway, a held shell answers without a process if
+            // one is free. Declining is normal and costs nothing: the spawn
+            // below is what this app did before there were channels at all.
+            _ => {
+                if let Some(answer) = self.channels.and_then(|c| {
+                    c.run(self.host, self.local, self.env, program, args, cwd, extra)
+                }) {
+                    return Ok(as_output(answer));
+                }
+                match self.host {
+                    Host::Local => unreachable!("handled above"),
+                    Host::Wsl { .. } => {
+                        let carried = carried_with(self.env, extra);
+                        let (_, wrapped, _) = self.host.wrap(program, &owned, cwd, &carried);
+                        Ok(std::process::Command::new(wsl_exe(self.local))
+                            .args(wrapped)
+                            .output()?)
+                    }
+                    Host::Ssh { host } => {
+                        let carried = carried_with(self.env, extra);
+                        let mut a = ssh_base_args(false);
+                        a.push("--".to_string());
+                        a.push(host.clone());
+                        a.push(remote_command(program, &owned, cwd, &carried));
+                        Ok(std::process::Command::new(ssh_exe(self.local))
+                            .args(a)
+                            .output()?)
+                    }
+                }
             }
         }
     }
@@ -924,6 +975,12 @@ fn carry_env(env: &ShellEnv) -> Vec<(String, String)> {
         .collect()
 }
 
+/// What crosses into a held shell: the same pair every wrapped command has
+/// always carried, set once at the far end instead of on every command line.
+pub fn carry_env_pub(env: &ShellEnv) -> Vec<(String, String)> {
+    carry_env(env)
+}
+
 /// `carry_env` plus one call's extras, extras last: POSIX `env` applies
 /// assignments left to right, so on a collision the extra wins — the same
 /// precedence the local path gets from calling `.envs` twice.
@@ -981,7 +1038,7 @@ mod tests {
         // 問版本要穿過門去問 —— distro 裡的檔案在門的另一邊,本機的
         // which() 摸不到(第一版測試的錯);core 的世界探測走的就是這條:
         // HostRef::run_ok 把指令包成 wsl.exe -d <distro> -e env … claude。
-        let hr = HostRef { host: &host, local: &local, env: &env };
+        let hr = HostRef { host: &host, local: &local, env: &env, channels: None };
         for agent in wanted {
             let out = hr
                 .run_ok(agent, &["--version"], None)
@@ -1228,6 +1285,7 @@ prompt".into()],
             host: &local,
             local: &env,
             env: &env,
+            channels: None,
         };
         let extra = [("MAROL_PROBE".to_string(), "set".to_string())];
         let with = hr

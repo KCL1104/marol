@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 #[path = "../src/agent.rs"]
 mod agent;
+#[path = "../src/channel.rs"]
+mod channel;
 #[path = "../src/config.rs"]
 mod config;
 #[path = "../src/core.rs"]
@@ -1754,18 +1756,23 @@ fn an_empty_followup_is_not_sent() {
 
 /* ---------------------------- crossings -------------------------------- */
 
-/// What Phase 1 actually bought, counted rather than described.
+/// What the two perf phases actually bought, counted rather than described.
 ///
-/// Every one of these reads used to cost a process per *question* through the
-/// doorway; they now cost a process per *answer*. Locally the difference is
-/// invisible — a fork is microseconds — which is exactly why the cost went
-/// unnoticed for so long, and why the number is pinned here against a world
-/// that has a door in front of it.
+/// Phase 1 made each read cost a process per *answer* instead of one per
+/// question. Phase 2 took the process away: the world holds a shell open, so
+/// a read is a line written to a pipe. Together they are the difference
+/// between a card that costs thirty Windows processes on a timer and one that
+/// costs none.
 ///
-/// Exact counts rather than upper bounds. A bound would let a regression add
-/// one crossing per card per fifteen seconds and still pass.
+/// Zero rather than a small number, and exact rather than a bound. A bound
+/// would let a regression put one crossing back per card per fifteen seconds
+/// and still pass — which is precisely the shape of the bug being prevented.
+///
+/// The shell itself is a process, paid once for the life of the world; by the
+/// time an attempt has been started its world has long since been reached, so
+/// what is measured here is the steady state a running desk actually lives in.
 #[test]
-fn a_read_through_a_doorway_costs_one_crossing_not_one_per_question() {
+fn a_read_through_a_doorway_costs_no_process_at_all() {
     let h = Harness::new("crossings");
     let _guard = h.rt.enter();
 
@@ -1792,9 +1799,8 @@ fn a_read_through_a_doorway_costs_one_crossing_not_one_per_question() {
     h.reset_crossings();
     let stat = h.core.attempt_stats(&a.attempt_id).expect("stats");
     let calls = h.crossings();
-    assert_eq!(
-        calls.len(),
-        1,
+    assert!(
+        calls.is_empty(),
         "the footprint cost {} crossings: {calls:#?}",
         calls.len()
     );
@@ -1805,7 +1811,7 @@ fn a_read_through_a_doorway_costs_one_crossing_not_one_per_question() {
     h.reset_crossings();
     let diff = h.core.attempt_diff(&a.attempt_id).expect("diff");
     let calls = h.crossings();
-    assert_eq!(calls.len(), 1, "the diff cost {} crossings: {calls:#?}", calls.len());
+    assert!(calls.is_empty(), "the diff cost {} crossings: {calls:#?}", calls.len());
     assert!(diff.contains("new4.txt"), "the untracked files left the diff: {diff}");
 
     // The Knows tab: six rules slots and two skill roots, which used to be
@@ -1816,9 +1822,8 @@ fn a_read_through_a_doorway_costs_one_crossing_not_one_per_question() {
     h.reset_crossings();
     let docs = h.core.agent_docs(&a.worktree_path).expect("docs");
     let calls = h.crossings();
-    assert_eq!(
-        calls.len(),
-        3,
+    assert!(
+        calls.is_empty(),
         "the Knows tab cost {} crossings: {calls:#?}",
         calls.len()
     );
@@ -1836,7 +1841,7 @@ fn a_read_through_a_doorway_costs_one_crossing_not_one_per_question() {
     h.reset_crossings();
     let listing = h.core.list_dir("wsl://TestOS", Some(&inner)).expect("list");
     let calls = h.crossings();
-    assert_eq!(calls.len(), 1, "one step cost {} crossings: {calls:#?}", calls.len());
+    assert!(calls.is_empty(), "one step cost {} crossings: {calls:#?}", calls.len());
     assert!(listing.is_repo, "the worktree did not read as a checkout");
     // The listing survives a directory whose *last* entry is a plain file.
     // The script ends in a `for` loop, so its own exit status used to be the
@@ -1852,6 +1857,19 @@ fn a_read_through_a_doorway_costs_one_crossing_not_one_per_question() {
         !listing.dirs.iter().any(|d| d.ends_with(".txt")),
         "a plain file was offered as a directory: {:?}",
         listing.dirs
+    );
+
+    // Held, not re-opened. A pool that started a shell per call would answer
+    // every assertion above and still be the thing this replaced.
+    h.reset_crossings();
+    for _ in 0..20 {
+        h.core.attempt_stats(&a.attempt_id).expect("stats");
+    }
+    let calls = h.crossings();
+    assert!(
+        calls.is_empty(),
+        "twenty reads opened {} shells: {calls:#?}",
+        calls.len()
     );
 }
 

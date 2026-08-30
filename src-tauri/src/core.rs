@@ -1527,6 +1527,10 @@ pub struct HostEnv {
     /// the tunnel could not be raised — sessions run either way, they just
     /// show no status.
     pub hooks: Option<hooks::Wiring>,
+    /// The shells this world holds open, so a command costs a write rather
+    /// than a process. Empty for the local host, which has no doorway to
+    /// amortise — see `channel`.
+    pub channels: crate::channel::Channels,
     /// What it takes to hold a session in this world past the app's own life,
     /// or `None` when this world cannot: no tmux in it, or nowhere to put the
     /// config. Resolved beside the environment probe, because both answer
@@ -1610,6 +1614,7 @@ impl HostEnv {
             host: &self.host,
             local,
             env: &self.env,
+            channels: Some(&self.channels),
         }
     }
 }
@@ -1830,6 +1835,9 @@ impl Core {
                     plugin_dir: s.plugin_dir.to_string_lossy().to_string(),
                     url: s.url(),
                 }),
+                // Nothing to amortise: a local command is already a fork, and
+                // `sh` is not on a Windows login-shell PATH.
+                channels: crate::channel::Channels::default(),
                 hold: self.local_hold(),
             },
             _ => {
@@ -1838,10 +1846,14 @@ impl Core {
                     anyhow!("the host's environment came back without a HOME")
                 })?;
                 // The host's CLIs, not ours — their versions gate their flags.
+                // No channel yet: this is the probe that decides whether the
+                // world is usable at all, and it runs while the `HostEnv`
+                // that would own one is still being built.
                 let hr = HostRef {
                     host: h,
                     local: &self.env,
                     env: &env,
+                    channels: None,
                 };
                 let probe = |exe: &str| {
                     hr.run_ok(exe, &["--version"], None)
@@ -1896,6 +1908,7 @@ impl Core {
                     versions,
                     worktree_root: format!("{home}/.marol/worktrees"),
                     hooks: wiring,
+                    channels: crate::channel::Channels::new(),
                     hold,
                 }
             }
@@ -4753,6 +4766,12 @@ impl Core {
         if let Some(h) = self.hooks.get() {
             h.stop();
         }
+        // Let go of every world's held shells. They are idle processes in
+        // somebody else's distro, kept alive only for this app's convenience,
+        // so they go when the convenience does.
+        for he in self.hosts.lock().unwrap().values() {
+            he.channels.close();
+        }
         // Close the standing SSH connections, tunnels and all — with
         // ControlPersist they would otherwise outlive the app.
         for h in self.hosts.lock().unwrap().keys() {
@@ -5814,6 +5833,7 @@ impl Core {
                 host: &Host::Local,
                 local: &self.env,
                 env: &self.env,
+                channels: None,
             };
             if !hr.is_dir(&loc.path) {
                 continue;
