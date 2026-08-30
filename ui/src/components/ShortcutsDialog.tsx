@@ -1,5 +1,5 @@
 import { useT } from '../i18n';
-import { ACTIONS, GESTURES, KEY_DOCS } from '../actions';
+import { ACTIONS, AGENT_KEYS, GESTURES, KEY_DOCS } from '../actions';
 import { Modal } from './Modal';
 
 /**
@@ -37,6 +37,23 @@ export function ShortcutsDialog({ onClose }: { onClose: () => void }) {
         </tbody>
       </table>
       <p className="muted small">{t('keys.shellNote')}</p>
+
+      <h3 className="modal-section">{t('keys.agentOwn')}</h3>
+      <table className="keys" data-testid="agent-keys">
+        <tbody>
+          {AGENT_KEYS.map(({ agent, combo, what }) => (
+            <tr key={agent + combo}>
+              <td>
+                <kbd>{combo}</kbd>
+              </td>
+              <td>
+                <span className="chip">{agent}</span> {t(what)}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="muted small">{t('keys.agentOwnNote')}</p>
 
       <h3 className="modal-section">{t('keys.gestures')}</h3>
       <table className="keys" data-testid="gestures">

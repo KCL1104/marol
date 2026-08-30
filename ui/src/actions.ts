@@ -93,6 +93,29 @@ export const KEY_DOCS: readonly { combo: string; what: MessageKey }[] = [
 ];
 
 /**
+ * Keys that belong to the agent, not to this desk.
+ *
+ * Listed apart from `KEY_DOCS` on purpose: everything in that table is a
+ * chord Marol binds and could change, and everything here is one the CLI
+ * owns and Marol merely knows about. Folding them together would tell a
+ * reader this app is responsible for a key it cannot alter.
+ *
+ * They earn a place at all because of what the wheel can and cannot do. On
+ * the alternate buffer — which is every agent pane in a world that has tmux
+ * — a wheel notch is cursor keys sent to the program, so it walks whatever
+ * that program calls scrolling. Codex's own transcript view is the thing
+ * that actually holds the conversation, and nothing on screen said so.
+ *
+ * Codex only, because Codex is the CLI whose table was measured
+ * (`keymap.rs`, the pager keymap). An entry here for a CLI nobody checked
+ * would be a guess wearing a shortcut's clothes.
+ */
+export const AGENT_KEYS: readonly { agent: string; combo: string; what: MessageKey }[] = [
+  { agent: 'codex', combo: 'Ctrl + T', what: 'keys.codexTranscript' },
+  { agent: 'codex', combo: 'PgUp · PgDn · Ctrl+U · Ctrl+D · j · k', what: 'keys.codexPager' },
+];
+
+/**
  * The pointer's side of the sheet. These lived only in tooltips, which the
  * sheet's own comment calls the way gestures go unfound — so the sheet
  * lists them beside the keys, one row per surface.

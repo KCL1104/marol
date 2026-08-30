@@ -8,6 +8,7 @@ import { api } from '../api';
 import { useT } from '../i18n';
 import { TERM_SR_EVENT, termSrEnabled } from '../termSr';
 import { xtermTheme } from '../theme';
+import { wheelSequence, wheelStep } from '../wheel';
 
 /** base64 -> bytes. The PTY sends bytes so xterm's own UTF-8 decoder can
  *  stitch multi-byte characters that straddle a read boundary. */
@@ -103,6 +104,46 @@ export function TerminalView({
         if (event.metaKey || event.ctrlKey) void api.openExternal(uri);
       }),
     );
+
+    /**
+     * The wheel, on the alternate buffer.
+     *
+     * Every agent pane in a world that has tmux sits on xterm's *alternate*
+     * buffer for its whole life — `hold_attach` runs `tmux new-session`, and
+     * a tmux client emits `ESC[?1049h` the moment it attaches (measured, on
+     * tmux 3.4, with this repo's own HOLD_CONF). The alt buffer has no
+     * scrollback, so xterm falls back to converting the wheel into cursor
+     * keys and letting the program scroll itself. That is the right idea; the
+     * arithmetic is what fails. See `wheel.ts` for the two defects, of which
+     * the trackpad one is the reason a wheel can feel simply dead.
+     *
+     * Two cases are deliberately handed straight back to xterm:
+     *
+     *   * **the app asked for wheel reports.** This handler is consulted at
+     *     two sites, and one of them is the mouse-protocol encoder — where
+     *     returning false would swallow a report the program explicitly
+     *     requested. Its wheel is not ours to interpret.
+     *   * **the normal buffer.** There is a real 10k scrollback there and
+     *     xterm's own viewport is the right thing to move.
+     */
+    const carry = { lines: 0 };
+    term.attachCustomWheelEventHandler((ev) => {
+      if (term.modes.mouseTrackingMode !== 'none') return true;
+      if (term.buffer.active.type !== 'alternate') return true;
+      // The cell height in CSS pixels, which is the unit a pixel-mode delta
+      // arrives in. Read off the laid-out element rather than xterm's private
+      // render service; a pane that has not been measured yet reports 0 and
+      // `wheelStep` answers 0 lines rather than inventing a number.
+      const cell = term.element ? term.element.clientHeight / term.rows : 0;
+      const step = wheelStep(ev.deltaY, ev.deltaMode, cell, term.rows, carry.lines);
+      carry.lines = step.carry;
+      const seq = wheelSequence(step.lines, term.modes.applicationCursorKeysMode);
+      // Consumed either way: a notch that only added to the carry must not
+      // fall through and scroll the page behind the terminal.
+      ev.preventDefault();
+      if (seq) void api.termWrite(id, seq);
+      return false;
+    });
 
     termRef.current = term;
     fitRef.current = fit;

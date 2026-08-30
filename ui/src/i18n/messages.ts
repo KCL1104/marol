@@ -148,6 +148,13 @@ export const en = {
   'keys.moveCard': 'Move the focused card',
   'keys.cycleTabs': 'Next / previous tab',
   'keys.sidebar': 'Collapse / expand the sidebar',
+  'keys.agentOwn': 'The agent’s own view',
+  // Named as what it holds rather than what it is called, because "transcript
+  // overlay" is the CLI's word and "everything said so far" is the question.
+  'keys.codexTranscript': 'Everything said so far, in a view you can scroll',
+  'keys.codexPager': 'Move around inside it (q closes)',
+  'keys.agentOwnNote':
+    'These belong to the CLI, not to Marol, so Marol cannot change them. The wheel scrolls whatever the agent on screen calls scrolling.',
   'keys.inspector': 'Toggle the inspector',
   'keys.escape': 'Close the dialog',
   'keys.shellNote': 'Inside a terminal, Marol’s shortcuts take Shift: Ctrl+Shift+E, not Ctrl+E.',
@@ -682,6 +689,11 @@ export const zhTW: Record<MessageKey, string> = {
   'keys.moveCard': '搬動聚焦的卡片',
   'keys.cycleTabs': '下一個 / 上一個分頁',
   'keys.sidebar': '收起 / 展開側欄',
+  'keys.agentOwn': 'agent 自己的畫面',
+  'keys.codexTranscript': '目前為止說過的全部，在一個可以捲動的畫面裡',
+  'keys.codexPager': '在裡面移動（q 關閉）',
+  'keys.agentOwnNote':
+    '這些鍵屬於 CLI 不屬於 Marol，Marol 改不動它們。滾輪捲動的是畫面上那個 agent 自己認定的捲動。',
   'keys.inspector': '開關檢視器',
   'keys.escape': '關閉對話框',
   'keys.shellNote': '在終端機內，Marol 的快捷鍵需加 Shift：Ctrl+Shift+E，不是 Ctrl+E。',

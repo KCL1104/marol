@@ -255,6 +255,24 @@ test.describe('the keyboard can drive', () => {
     await expect(page.getByTestId('shortcuts')).toHaveCount(0);
   });
 
+  /**
+   * 滾輪修好之後仍然成立的那件事:在 agent 的整頁畫面裡,捲動是那個
+   * CLI 的事,不是 Marol 的。所以表上把它們分開列 —— 同一張表混在一起
+   * 會讓人以為這個 app 改得動 Ctrl+T。
+   */
+  test('the sheet names the agent’s own keys, apart from Marol’s own', async ({ page }) => {
+    await boot(page);
+    await page.keyboard.press('ControlOrMeta+/');
+    await expect(page.getByTestId('shortcuts')).toBeVisible();
+
+    const agent = page.getByTestId('agent-keys');
+    await expect(agent).toBeVisible();
+    await expect(agent).toContainText('Ctrl + T');
+    await expect(agent).toContainText('codex');
+    // 分開的兩張表:agent 的鍵不能出現在 Marol 自己那張上。
+    await expect(page.getByTestId('shortcuts')).not.toContainText('Ctrl + T');
+  });
+
   test('j and k walk the commentable diff lines', async ({ page }) => {
     await boot(page);
     await toBoard(page);
