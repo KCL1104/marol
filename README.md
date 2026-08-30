@@ -1251,6 +1251,20 @@ the person started, and this is not one of those. Filing it as a prompt would
 have told whoever reads the record afterwards the same lie the frame exists to
 stop telling the agent.
 
+**The chain has a ceiling, and the way out of it is you.** Two agents
+answering each other is a runaway the queue cannot see: neither side ever
+holds more than one message, so a pair could trade turns until the app closed
+and never fill anything. What runs away is the chain, and every link in it is
+a whole agent turn somebody pays for while not watching. So each session
+carries how far what it was last told sits from the last thing a person said
+— a person is zero, every relay adds one — and past eight the desk refuses to
+carry the message and tells the sender to ask the person at the keyboard
+instead. Typing into either terminal puts the count back to zero, because
+that is the supervision the ceiling exists to require. The drawer shows the
+depth from the first relay, so you can watch three become five and step in
+before anything is refused on your behalf, and the card says so when a
+message is actually held back.
+
 **Each CLI learns it through its own door.** Claude Code reads a skill out of
 the plugin `--plugin-dir` carries. Codex has no per-launch equivalent — its
 skills live in `~/.codex/skills`, the person's own configuration, which this
@@ -1308,10 +1322,30 @@ freezing, the second and third made the work actually smaller.
 - **A world holds a shell open.** One `sh` per world, and every later command
   is a line written to its stdin, so those reads cost no process at all. It is
   an optimisation and never a dependency: a world that will not hold a shell,
-  a shell that died, a command too large for a pipe, or simply every channel
-  busy all fall back to spawning the command the old way. The frame counts
-  bytes rather than ending on a marker, because output is bytes and any
-  terminator would eventually appear inside a file being read.
+  a command too large for a pipe, or simply every shell busy all fall back to
+  spawning the command the old way. The frame counts bytes rather than ending
+  on a marker, because output is bytes and any terminator would eventually
+  appear inside a file being read.
+
+  One failure must not fall back, and telling it apart from the others is the
+  point of the three-way answer. Once a command has been written to a shell,
+  that shell going quiet does not mean it did not run — `git commit` writes
+  its commit and then the pipe breaks just the same, and spawning again would
+  be a second commit. So a failure after the line was sent is *lost*, not
+  *declined*: raised to you rather than retried, naming what it will not
+  guess at.
+
+  A shell that goes quiet for five minutes is given up on and killed. Not a
+  latency budget — nothing here ever had one, and one tight enough to be a
+  budget would call a slow clone a lost command. It is the point past which a
+  shell is not slow but stuck, so the slot it holds and the thread blocked on
+  it come back instead of being gone for the life of the app.
+
+  Declining is silent and correct, which is exactly why it is counted: a
+  world with no `sh` on the far side behaves like one where the channel is
+  working, only slower, and nothing would say why. The diagnostics carry a
+  row per world — how many commands were answered without starting a process,
+  out of how many, with lost ones named separately.
 
 Locally none of the batching or the channels apply, for two reasons: there is
 no doorway to amortise, and `sh` is not on a Windows login-shell PATH. A test
