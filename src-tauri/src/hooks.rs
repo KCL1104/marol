@@ -142,10 +142,40 @@ pub fn name_url(hook_url: &str, session_id: &str) -> String {
     format!("{hook_url}?sid={session_id}&set=name")
 }
 
-/// What arrived on the listener: a status report, or a session naming itself.
+/// Where a session asks who else is on this desk, and where it writes to one.
+///
+/// Both carry a per-session token that `name_url` deliberately does not.
+/// Naming is a session talking about *itself*, and the worst a forged one can
+/// do is retitle a row. These two are different in kind: `peers` discloses the
+/// desk's other sessions, and `send` puts text into one of them. That turns
+/// the endpoint from "report about yourself" into "act on someone else", and
+/// an address anything on the machine could guess is not enough to stand
+/// behind that.
+///
+/// The token is minted per session and never leaves this process except into
+/// that session's own environment — in particular it is not on `SessionMeta`,
+/// which is serialised straight to the webview.
+pub fn peers_url(hook_url: &str, session_id: &str, token: &str) -> String {
+    format!("{hook_url}?sid={session_id}&tok={token}&peers=1")
+}
+
+pub fn send_url(hook_url: &str, session_id: &str, token: &str) -> String {
+    format!("{hook_url}?sid={session_id}&tok={token}&send=1")
+}
+
+/// What arrived on the listener.
 pub enum Incoming {
     Status(HookReport),
     Name(NameReport),
+    /// A session asking what else is running on this desk.
+    Peers { session_id: String, token: String },
+    /// A session writing to another one, named by its id.
+    Send {
+        session_id: String,
+        token: String,
+        to: String,
+        text: String,
+    },
 }
 
 pub trait HookHandler: Send + Sync + 'static {
@@ -154,6 +184,29 @@ pub trait HookHandler: Send + Sync + 'static {
     /// A session saying what it should be called. Ignored by default, so a
     /// handler that only cares about status stays as short as it was.
     fn on_name(&self, _report: NameReport) {}
+
+    /// Who else is on this desk, as plain text — one session per line,
+    /// `id<TAB>name<TAB>status`. `None` refuses: an unknown session, or a
+    /// token that is not that session's.
+    ///
+    /// Ids rather than names as the address, and that is what keeps the whole
+    /// channel free of escaping: a uuid is safe in a header and a query, while
+    /// a name is a person's sentence and may hold anything.
+    fn on_peers(&self, _session_id: &str, _token: &str) -> Option<String> {
+        None
+    }
+
+    /// One session writing to another. `Err` is a reason to hand back to the
+    /// sender — a wrong token, a session that is gone, a full queue.
+    fn on_send(
+        &self,
+        _session_id: &str,
+        _token: &str,
+        _to: &str,
+        _text: &str,
+    ) -> Result<(), String> {
+        Err("this desk is not carrying messages".to_string())
+    }
 }
 
 pub struct HookServer {
@@ -326,14 +379,45 @@ pub async fn start(data_dir: &Path, handler: Arc<dyn HookHandler>) -> Result<Hoo
 /// of those arrangements already knows this URL. A second endpoint would have
 /// had to be taught all of it again.
 async fn serve(mut stream: tokio::net::TcpStream, want_prefix: &str, handler: Arc<dyn HookHandler>) {
-    match read_request(&mut stream, want_prefix).await {
-        Some(Incoming::Status(report)) => handler.on_hook(report),
-        Some(Incoming::Name(report)) => handler.on_name(report),
-        None => {}
-    }
-    let _ = stream
-        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-        .await;
+    // A hook report is answered 200 whatever happens to it — a non-200 is a
+    // failed hook as far as the CLI is concerned, and a desk's opinion must
+    // never become an agent's problem. The two channels a session *asks*
+    // something on are different: there, a refusal is the answer.
+    let (status, body) = match read_request(&mut stream, want_prefix).await {
+        Some(Incoming::Status(report)) => {
+            handler.on_hook(report);
+            ("200 OK", String::new())
+        }
+        Some(Incoming::Name(report)) => {
+            handler.on_name(report);
+            ("200 OK", String::new())
+        }
+        Some(Incoming::Peers { session_id, token }) => match handler.on_peers(&session_id, &token) {
+            Some(list) => ("200 OK", list),
+            None => ("403 Forbidden", "not this session's token\n".to_string()),
+        },
+        Some(Incoming::Send {
+            session_id,
+            token,
+            to,
+            text,
+        }) => match handler.on_send(&session_id, &token, &to, &text) {
+            Ok(()) => ("200 OK", "sent\n".to_string()),
+            // 409 rather than 400: the request was well formed and the desk
+            // declined it — a full queue, a session that has gone. The body
+            // is the reason, in the sender's hands, which is the whole point
+            // of refusing rather than dropping.
+            Err(why) => ("409 Conflict", format!("{why}\n")),
+        },
+        None => ("200 OK", String::new()),
+    };
+    let head = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: text/plain; charset=utf-8\r\n\
+         content-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes()).await;
+    let _ = stream.write_all(body.as_bytes()).await;
     let _ = stream.shutdown().await;
 }
 
@@ -368,6 +452,7 @@ async fn read_request(
     // Session id arrives in a header from `http` hooks and in the query from
     // the `command` hook that covers SessionStart.
     let mut session_id: Option<String> = None;
+    let mut to: Option<String> = None;
     let mut content_length = 0usize;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
@@ -383,6 +468,11 @@ async fn read_request(
             // of its life — the same failure the stable endpoint exists to
             // prevent, caused by us instead of by a port.
             "x-marol-session" | "x-agentdesk-session" => session_id = Some(value.to_string()),
+            // Whom a message is for, as that session's id. A header rather
+            // than the query because it keeps `send_url` a constant the agent
+            // uses verbatim — the same property that makes `$MAROL_NAME_URL`
+            // safe to hand to a shell.
+            "x-marol-to" => to = Some(value.to_string()),
             "content-length" => content_length = value.parse().unwrap_or(0),
             _ => {}
         }
@@ -390,6 +480,9 @@ async fn read_request(
 
     let mut state = None;
     let mut naming = false;
+    let mut peers = false;
+    let mut sending = false;
+    let mut token: Option<String> = None;
     if let Some(query) = target.split_once('?').map(|(_, q)| q) {
         for pair in query.split('&') {
             match pair.split_once('=') {
@@ -400,6 +493,18 @@ async fn read_request(
                 }
                 Some(("set", "name")) => {
                     naming = true;
+                    continue;
+                }
+                Some(("peers", _)) => {
+                    peers = true;
+                    continue;
+                }
+                Some(("send", _)) => {
+                    sending = true;
+                    continue;
+                }
+                Some(("tok", v)) if !v.is_empty() => {
+                    token = Some(v.to_string());
                     continue;
                 }
                 _ => continue,
@@ -432,6 +537,28 @@ async fn read_request(
     // an agent can send one without composing JSON or percent-encoding a
     // query. Handled before the JSON parse for that reason — there is
     // nothing here for `serde_json` to read.
+    // Both of these are answered rather than merely accepted, so they are
+    // decided here beside naming — before the JSON parse, which has nothing
+    // to read in either one.
+    if peers || sending {
+        let session_id = session_id.filter(|s| expanded(s))?;
+        let token = token?;
+        if peers {
+            return Some(Incoming::Peers { session_id, token });
+        }
+        let text = String::from_utf8_lossy(&body).trim().to_string();
+        let to = to.filter(|t| expanded(t))?;
+        if text.is_empty() {
+            return None;
+        }
+        return Some(Incoming::Send {
+            session_id,
+            token,
+            to,
+            text,
+        });
+    }
+
     if naming {
         let name = String::from_utf8_lossy(&body).trim().to_string();
         let session_id = session_id.filter(|s| expanded(s))?;
@@ -702,6 +829,7 @@ pub fn plugin_files(url: &str) -> Vec<(&'static str, String)> {
             serde_json::to_string_pretty(&hooks_json(url)).unwrap_or_default(),
         ),
         ("skills/name-this-session/SKILL.md", NAME_SKILL.to_string()),
+        ("skills/message-another-session/SKILL.md", PEERS_SKILL.to_string()),
     ]
 }
 
@@ -764,6 +892,80 @@ Naming again replaces the name; do it when the work changes, not on a timer.
 The rename lands on the person's board immediately. It does not change the
 name the CLI answers to for messages from other sessions, which was fixed when
 this session started.
+"#;
+
+/// How a session reaches the others on this desk.
+///
+/// The second thing in the plugin that is not a hook, and it exists because
+/// Claude Code's own cross-session messaging cannot answer the question this
+/// app actually has. That feature is per machine — a socket under `/tmp` and
+/// a registry in `~/.claude` — while a Marol desk routinely spans a WSL
+/// distro and an SSH host, whose filesystems share neither. And it is Claude
+/// Code's, so a Codex session can neither be addressed by it nor use it.
+///
+/// This channel is the desk's own, so it crosses those boundaries the same
+/// way status reports already do, and either measured CLI can be on either
+/// end of it. Delivery into a session is a paste into its terminal, which is
+/// exactly what a person's own follow-up is — so nothing new had to be taught
+/// about how a message *arrives*, only about how one is *sent*.
+///
+/// **Addressed by id, not by name.** A name is a person's sentence and may
+/// hold a quote, a space, a newline; an id is a uuid. That single choice is
+/// why nothing in here needs escaping, percent-encoding, or JSON — the same
+/// property that makes `$MAROL_NAME_URL` safe to hand to a shell.
+///
+/// **Token cost is not measured yet.** `NAME_SKILL` carries a measured
+/// figure because a claim of that shape should be checkable; this one has not
+/// been put through `claude plugin details` on a real CLI, and saying so is
+/// better than inventing a number beside a measured one.
+const PEERS_SKILL: &str = r#"---
+name: message-another-session
+description: Send a message to another agent session running beside this one on the same Marol desk, and list which sessions those are. Use when work here depends on, blocks, or duplicates work another session is doing — not to chat.
+---
+
+# Message another session
+
+This session runs in a Marol window beside other agents, some of which may be
+a different CLI entirely. Each has a row on the person's board, an id, and a
+terminal of its own.
+
+## Who else is here
+
+```bash
+curl -sS --max-time 3 "$MAROL_PEERS_URL"
+```
+
+One session per line, tab separated: `id`, name, status. The id is the
+address; the name is what the person calls it.
+
+## Send one a message
+
+```bash
+curl -sS --max-time 3 -X POST "$MAROL_SEND_URL"   -H "X-Marol-To: <the id from the list>"   --data-binary "The auth fix landed on branch fix-login; rebase before you touch session.py."
+```
+
+- Use `$MAROL_PEERS_URL` and `$MAROL_SEND_URL` exactly as they are. Do not
+  build a URL out of their parts; each already carries this session's identity.
+- The body is the message, as plain text. No JSON, no escaping.
+- The reply is `sent`, or a plain-text reason it was not: a wrong id, a
+  session whose terminal has gone, a queue that is full.
+- If either variable is unset, this session is not wired for it. Do nothing
+  and do not mention it.
+
+## What actually happens to it
+
+The message is put in that session's queue and delivered when its current
+turn ends — or straight away if it is not mid-turn. It arrives in its
+terminal marked as coming from you and explicitly not from the person, so it
+will be read as information from a peer rather than as an instruction from
+whoever is at the keyboard.
+
+That is the line to keep in mind when writing one: another agent cannot
+approve anything on the person's behalf, and neither can you. Send facts,
+findings and warnings. Anything that needs a human decision still needs one.
+
+Say who you are and what you want in the first sentence — it is read cold, in
+the middle of somebody else's work.
 "#;
 
 /// Write (or refresh) the plugin so an app upgrade updates the hooks too.

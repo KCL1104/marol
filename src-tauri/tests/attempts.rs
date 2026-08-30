@@ -95,7 +95,7 @@ struct Harness {
 /// test's boot by the probe's timeout.
 const STUB: &str = r#"#!/bin/bash
 if [ "$1" = "--version" ]; then echo "2.1.226 (Claude Code)"; exit 0; fi
-printf '%s\0' "$PWD" "${MAROL_NAME_URL:-}" "$@" > "$MAROL_STUB_LOG/${MAROL_SESSION_ID:-unknown}.$$"
+printf '%s\0' "$PWD" "${MAROL_NAME_URL:-}" "${MAROL_PEERS_URL:-}" "${MAROL_SEND_URL:-}" "$@" > "$MAROL_STUB_LOG/${MAROL_SESSION_ID:-unknown}.$$"
 # 宣告它所替身的那個 CLI 真的會宣告的模式:Claude Code 開啟 bracketed
 # paste(DECSET 2004),而 `bracketed_followup` 只送給量測過會開它的 CLI。
 # 這一行之前 stub 是個沉默的位元組水槽,而任何會照 2004 決定要不要轉發
@@ -113,7 +113,7 @@ exec cat > "$MAROL_STUB_LOG/stdin.${MAROL_SESSION_ID:-unknown}.$$"
 /// that shape pass.
 const CODEX_STUB: &str = r#"#!/bin/bash
 if [ "$1" = "--version" ]; then echo "codex-cli 0.147.0"; exit 0; fi
-printf '%s\0' "$PWD" "${MAROL_NAME_URL:-}" "$@" > "$MAROL_STUB_LOG/${MAROL_SESSION_ID:-unknown}.$$"
+printf '%s\0' "$PWD" "${MAROL_NAME_URL:-}" "${MAROL_PEERS_URL:-}" "${MAROL_SEND_URL:-}" "$@" > "$MAROL_STUB_LOG/${MAROL_SESSION_ID:-unknown}.$$"
 printf '\033[?2004h'
 exec cat > "$MAROL_STUB_LOG/stdin.${MAROL_SESSION_ID:-unknown}.$$"
 "#;
@@ -122,7 +122,7 @@ exec cat > "$MAROL_STUB_LOG/stdin.${MAROL_SESSION_ID:-unknown}.$$"
 /// given for the tests that assert it was given nothing of ours.
 const UNMEASURED_STUB: &str = r#"#!/bin/bash
 if [ "$1" = "--version" ]; then echo "0.9.0"; exit 0; fi
-printf '%s\0' "$PWD" "${MAROL_NAME_URL:-}" "$@" > "$MAROL_STUB_LOG/${MAROL_SESSION_ID:-unknown}.$$"
+printf '%s\0' "$PWD" "${MAROL_NAME_URL:-}" "${MAROL_PEERS_URL:-}" "${MAROL_SEND_URL:-}" "$@" > "$MAROL_STUB_LOG/${MAROL_SESSION_ID:-unknown}.$$"
 exec cat > "$MAROL_STUB_LOG/stdin.${MAROL_SESSION_ID:-unknown}.$$"
 "#;
 
@@ -130,7 +130,7 @@ exec cat > "$MAROL_STUB_LOG/stdin.${MAROL_SESSION_ID:-unknown}.$$"
 /// What matters is what it is NOT handed: `--name` would stop it starting.
 const OLD_STUB: &str = r#"#!/bin/bash
 if [ "$1" = "--version" ]; then echo "2.0.14 (Claude Code)"; exit 0; fi
-printf '%s\0' "$PWD" "${MAROL_NAME_URL:-}" "$@" > "$MAROL_STUB_LOG/${MAROL_SESSION_ID:-unknown}.$$"
+printf '%s\0' "$PWD" "${MAROL_NAME_URL:-}" "${MAROL_PEERS_URL:-}" "${MAROL_SEND_URL:-}" "$@" > "$MAROL_STUB_LOG/${MAROL_SESSION_ID:-unknown}.$$"
 exec cat > "$MAROL_STUB_LOG/stdin.${MAROL_SESSION_ID:-unknown}.$$"
 "#;
 
@@ -335,10 +335,11 @@ exec "$@"
                     if parts.last().is_some_and(|s| s.is_empty()) {
                         parts.pop();
                     }
-                    // The working directory and the naming endpoint, then
-                    // argv. A record missing either header is a half-written
-                    // file caught mid-`printf`, not a launch.
-                    if parts.len() < 2 {
+                    // The working directory, the naming endpoint and the two
+                    // messaging endpoints, then argv. A record missing any of
+                    // those headers is a half-written file caught
+                    // mid-`printf`, not a launch.
+                    if parts.len() < 4 {
                         continue;
                     }
                     let when = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
@@ -347,6 +348,8 @@ exec "$@"
                         Launch {
                             cwd: parts.remove(0),
                             name_url: parts.remove(0),
+                            peers_url: parts.remove(0),
+                            send_url: parts.remove(0),
                             args: parts,
                         },
                     ));
@@ -553,6 +556,10 @@ struct Launch {
     /// environment the process actually got. Empty when the world had no
     /// listener to point at — which is the honest answer, not a failure.
     name_url: String,
+    /// The two channels a session can ask on, each already carrying this
+    /// session's own token. Empty for the same reason `name_url` is.
+    peers_url: String,
+    send_url: String,
     args: Vec<String>,
 }
 
@@ -1725,6 +1732,163 @@ fn an_empty_followup_is_not_sent() {
     assert!(h.core.send_followup(&a.session_id, "  \n").is_err());
 }
 
+/* -------------------------- session to session ------------------------- */
+
+/// A tiny HTTP client, because the sender under test is a `curl` one-liner
+/// and the thing worth checking is exactly what that one-liner would get
+/// back — a status line and a plain-text body.
+fn post(url: &str, headers: &[(&str, &str)], body: &str) -> (String, String) {
+    use std::io::{Read as _, Write as _};
+    let rest = url.trim_start_matches("http://");
+    let (addr, path) = rest.split_once('/').expect("url has a path");
+    let extra: String = headers
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}\r\n"))
+        .collect();
+    let mut sock = std::net::TcpStream::connect(addr).expect("connect to the listener");
+    let req = format!(
+        "POST /{path} HTTP/1.1\r\nHost: localhost\r\n{extra}content-length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    sock.write_all(req.as_bytes()).unwrap();
+    let mut resp = String::new();
+    let _ = sock.read_to_string(&mut resp);
+    let (head, body) = resp.split_once("\r\n\r\n").unwrap_or((resp.as_str(), ""));
+    let status = head.lines().next().unwrap_or_default().to_string();
+    (status, body.to_string())
+}
+
+fn get(url: &str) -> (String, String) {
+    use std::io::{Read as _, Write as _};
+    let rest = url.trim_start_matches("http://");
+    let (addr, path) = rest.split_once('/').expect("url has a path");
+    let mut sock = std::net::TcpStream::connect(addr).expect("connect to the listener");
+    sock.write_all(format!("GET /{path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+        .unwrap();
+    let mut resp = String::new();
+    let _ = sock.read_to_string(&mut resp);
+    let (head, body) = resp.split_once("\r\n\r\n").unwrap_or((resp.as_str(), ""));
+    (head.lines().next().unwrap_or_default().to_string(), body.to_string())
+}
+
+/// The whole bridge, end to end and across CLIs: a codex session lists the
+/// desk, finds a claude session by id, writes to it, and the message lands in
+/// that session's terminal wearing the frame that says whose it is.
+///
+/// Cross-CLI is the point rather than a variation. Claude Code's own
+/// cross-session messaging cannot do this at all — it is Claude Code's, and
+/// per machine besides — so this is the case the desk's own channel exists
+/// for.
+#[test]
+fn a_codex_session_can_message_a_claude_session_and_it_arrives_marked() {
+    let h = Harness::new("bridge");
+    let _guard = h.rt.enter();
+
+    let t1 = h.card("Fix login", "make it work");
+    let a1 = h.start(&t1, "claude");
+    let claude = h.launches(&a1.session_id, 1);
+    let t2 = h.card("Port the tests", "port them");
+    let a2 = h.start(&t2, "codex");
+    let codex = h.launches(&a2.session_id, 1);
+
+    // Both were handed the two endpoints, each with its own token.
+    assert!(!codex[0].send_url.is_empty(), "codex got no send endpoint");
+    assert!(!claude[0].send_url.is_empty(), "claude got no send endpoint");
+    assert_ne!(
+        codex[0].send_url, claude[0].send_url,
+        "two sessions were handed the same address"
+    );
+
+    // The codex session looks around. It sees the claude session and not
+    // itself — an address list holding your own address invites a loop.
+    let (status, listing) = get(&codex[0].peers_url);
+    assert!(status.contains("200"), "peers refused: {status}");
+    assert!(
+        listing.contains(&a1.session_id),
+        "the claude session is not on the list: {listing:?}"
+    );
+    assert!(
+        !listing.contains(&a2.session_id),
+        "a session was offered its own address: {listing:?}"
+    );
+
+    // And writes to it, addressing by the id the listing gave.
+    let (status, reply) = post(
+        &codex[0].send_url,
+        &[("X-Marol-To", &a1.session_id)],
+        "auth.py is mine — do not touch it",
+    );
+    assert!(status.contains("200"), "send refused: {status} {reply}");
+
+    // It arrives in the claude session's terminal, framed.
+    let stdin = h.stdin_when(&a1.session_id, |s| s.contains("do not touch it"));
+    assert!(stdin.contains("[marol]"), "the message wore no frame: {stdin:?}");
+    assert!(
+        stdin.contains("Not from the person"),
+        "the frame does not disclaim the person: {stdin:?}"
+    );
+    assert!(
+        stdin.contains("Port the tests"),
+        "the frame does not name the sender: {stdin:?}"
+    );
+}
+
+/// The token is what turns `sid` from a guess into an identity. Without the
+/// check, any session on the desk could read a sibling's uuid and write to
+/// the board on its behalf — this channel puts text into another agent, so
+/// an address anything can guess is not enough to stand behind it.
+#[test]
+fn a_borrowed_address_without_its_token_is_refused() {
+    let h = Harness::new("bridgetok");
+    let _guard = h.rt.enter();
+    let t1 = h.card("Fix login", "make it work");
+    let a1 = h.start(&t1, "claude");
+    h.launches(&a1.session_id, 1);
+    let t2 = h.card("Port the tests", "port them");
+    let a2 = h.start(&t2, "codex");
+    let codex = h.launches(&a2.session_id, 1);
+
+    let forged = codex[0]
+        .send_url
+        .split("&tok=")
+        .next()
+        .map(|head| format!("{head}&tok=00000000000000000000000000000000&send=1"))
+        .expect("the endpoint carries a token at all");
+    let (status, body) = post(&forged, &[("X-Marol-To", &a1.session_id)], "let me in");
+    assert!(status.contains("409"), "a forged token was accepted: {status}");
+    assert!(body.contains("token"), "the refusal does not say why: {body:?}");
+
+    // And nothing reached the terminal.
+    std::thread::sleep(Duration::from_millis(300));
+    let stdin = h.stdin_when(&a1.session_id, |_| true);
+    assert!(!stdin.contains("let me in"), "a forged message got through: {stdin:?}");
+}
+
+/// A refusal is an answer, not a silence: the sender is an agent that can act
+/// on it. Every way a send can fail names itself.
+#[test]
+fn every_refused_send_hands_back_a_reason() {
+    let h = Harness::new("bridgewhy");
+    let _guard = h.rt.enter();
+    let t1 = h.card("Fix login", "make it work");
+    let a1 = h.start(&t1, "claude");
+    let claude = h.launches(&a1.session_id, 1);
+
+    // A session that is not here.
+    let (status, body) = post(
+        &claude[0].send_url,
+        &[("X-Marol-To", "11111111-2222-3333-4444-555555555555")],
+        "hello?",
+    );
+    assert!(status.contains("409"), "{status}");
+    assert!(body.contains("no session here"), "{body:?}");
+
+    // Itself. A session talking to itself is a loop with an extra step.
+    let (status, body) = post(&claude[0].send_url, &[("X-Marol-To", &a1.session_id)], "hi me");
+    assert!(status.contains("409"), "{status}");
+    assert!(body.contains("cannot message itself"), "{body:?}");
+}
+
 /* ------------------------------ WSL bridge ----------------------------- */
 
 /// M10a end to end, through a stand-in wsl.exe: a `wsl://` card's worktree is
@@ -2258,7 +2422,7 @@ impl SshFixture {
                 }
                 let body = format!(
                     "#!/bin/bash\nif [ \"$1\" = \"--version\" ]; then echo \"2.1.226 (Claude Code)\"; exit 0; fi\n\
-                     printf '%s\\0' \"$PWD\" \"${{MAROL_NAME_URL:-}}\" \"$@\" > \"{logs}/${{MAROL_SESSION_ID:-unknown}}.$$\"\n\
+                     printf '%s\\0' \"$PWD\" \"${{MAROL_NAME_URL:-}}\" \"${{MAROL_PEERS_URL:-}}\" \"${{MAROL_SEND_URL:-}}\" \"$@\" > \"{logs}/${{MAROL_SESSION_ID:-unknown}}.$$\"\n\
                      exec cat > \"{logs}/stdin.${{MAROL_SESSION_ID:-unknown}}.$$\"\n",
                     logs = logs.display()
                 );

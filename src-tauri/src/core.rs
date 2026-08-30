@@ -842,6 +842,15 @@ struct Router {
     /// command once in a while, read on every hook.
     notify_prefs: Arc<Mutex<NotifyPrefs>>,
     sessions: Arc<Mutex<HashMap<String, SessionMeta>>>,
+    /// Each wired session's own token for the two channels it can *ask* on.
+    ///
+    /// Shared with the core rather than reached through the weak reference,
+    /// because it is read on every message and a `send` that raced the core's
+    /// teardown should refuse rather than upgrade a dead pointer.
+    ///
+    /// Never on `SessionMeta`: that struct is serialised to the webview on
+    /// every broadcast, and a token in it would be a token in the page.
+    send_tokens: Arc<Mutex<HashMap<String, String>>>,
     /// Set once the core exists, so an exiting terminal can let the queue know
     /// a slot just came free. Weak, because the core owns this router.
     core: OnceLock<std::sync::Weak<Core>>,
@@ -855,6 +864,23 @@ struct Router {
 }
 
 impl Router {
+    /// Whether this really is that session speaking.
+    ///
+    /// Constant-time is not the property that matters here — the token is a
+    /// v4 uuid handed only to one local process's environment, and anything
+    /// positioned to time this endpoint is already inside the machine. What
+    /// matters is that it is checked at all: `sid` alone is a uuid a sibling
+    /// session could read out of its own environment and reuse.
+    fn token_ok(&self, session_id: &str, token: &str) -> bool {
+        !token.is_empty()
+            && self
+                .send_tokens
+                .lock()
+                .unwrap()
+                .get(session_id)
+                .is_some_and(|t| t == token)
+    }
+
     fn broadcast(&self) {
         let mut list: Vec<SessionMeta> = self.sessions.lock().unwrap().values().cloned().collect();
         list.sort_by(|a, b| b.last_active_at.cmp(&a.last_active_at));
@@ -1100,6 +1126,75 @@ impl HookHandler for Router {
         }
     }
 
+    /// Who else is on this desk, for a session that wants to write to one.
+    ///
+    /// Live agent sessions only, and never the asker itself — a list holding
+    /// your own address invites a loop, and a shell or a run script is not
+    /// something to address. Plain text, one per line, because the sender is
+    /// a shell one-liner and `cut -f1` is the whole parser it should need.
+    fn on_peers(&self, session_id: &str, token: &str) -> Option<String> {
+        if !self.token_ok(session_id, token) {
+            return None;
+        }
+        let sessions = self.sessions.lock().unwrap();
+        let mut rows: Vec<String> = sessions
+            .values()
+            .filter(|s| s.id != session_id && s.live && s.agent_session)
+            .map(|s| format!("{}\t{}\t{}", s.id, s.title, status_name(s.status)))
+            .collect();
+        rows.sort();
+        Some(rows.join("\n") + if rows.is_empty() { "" } else { "\n" })
+    }
+
+    /// One session writing to another.
+    ///
+    /// Queued rather than typed straight in, always: the target may be
+    /// mid-turn, and a paste landing in the middle of one steers it instead
+    /// of answering it. A target that is *not* mid-turn has its queue flushed
+    /// at once, so a message to an idle agent arrives now rather than waiting
+    /// for a turn that may never come.
+    ///
+    /// Every refusal names itself, because the sender is an agent that can
+    /// act on the answer — which is the whole reason this returns a reason
+    /// rather than dropping the message.
+    fn on_send(&self, session_id: &str, token: &str, to: &str, text: &str) -> Result<(), String> {
+        if !self.token_ok(session_id, token) {
+            return Err("not this session's token".to_string());
+        }
+        if session_id == to {
+            return Err("a session cannot message itself".to_string());
+        }
+        let (from, target_idle) = {
+            let sessions = self.sessions.lock().unwrap();
+            let from = sessions
+                .get(session_id)
+                .ok_or_else(|| "the sending session is not on this desk".to_string())?
+                .title
+                .clone();
+            let target = sessions
+                .get(to)
+                .ok_or_else(|| format!("no session here with id {to}"))?;
+            if !target.live {
+                return Err(format!("「{}」 has no terminal any more", target.title));
+            }
+            (
+                from,
+                !matches!(target.status, Status::Running | Status::Starting),
+            )
+        };
+        let core = self
+            .core
+            .get()
+            .and_then(|w| w.upgrade())
+            .ok_or_else(|| "this desk is shutting down".to_string())?;
+        core.enqueue_followup(to, text, Some(from))
+            .map_err(|e| format!("{e:#}"))?;
+        if target_idle {
+            core.flush_followup(to);
+        }
+        Ok(())
+    }
+
     /// A session saying what it should be called.
     ///
     /// The rename writes to SQLite, and the iron law of this path is that an
@@ -1217,6 +1312,8 @@ pub struct Core {
     /// would have had the second silently evict the first, with neither
     /// sender told and no trace that a message ever existed.
     followups: Mutex<HashMap<String, VecDeque<Pending>>>,
+    /// Per-session tokens for the peers/send channels. See `Router`.
+    send_tokens: Arc<Mutex<HashMap<String, String>>>,
     /// Everything known about each execution environment, resolved on first
     /// use and kept: a WSL distro's login environment costs a probe, and the
     /// answer does not change under a running app.
@@ -1596,11 +1693,13 @@ impl Core {
             }
         }
 
+        let send_tokens: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
         let router = Arc::new(Router {
             sink: Arc::clone(&sink),
             locale: Arc::clone(&locale),
             notify_prefs: Arc::clone(&notify_prefs),
             sessions: Arc::clone(&sessions),
+            send_tokens: Arc::clone(&send_tokens),
             core: OnceLock::new(),
             events: events_tx,
         });
@@ -1611,6 +1710,7 @@ impl Core {
             store,
             ptys: PtyRegistry::new(),
             sessions,
+            send_tokens,
             tabs: Mutex::new(tabs),
             sink: Arc::clone(&sink),
             router: Arc::clone(&router),
@@ -4154,6 +4254,24 @@ impl Core {
             session_env.push((
                 "MAROL_NAME_URL".to_string(),
                 hooks::name_url(&wiring.url, id),
+            ));
+            // The two channels a session can *ask* on, each carrying a token
+            // minted for this session alone. Minted fresh per launch, so a
+            // token learned from a session that has since been restarted
+            // stops working — and never stored, because it is worth exactly
+            // one running process.
+            let token = uuid::Uuid::new_v4().simple().to_string();
+            self.send_tokens
+                .lock()
+                .unwrap()
+                .insert(id.to_string(), token.clone());
+            session_env.push((
+                "MAROL_PEERS_URL".to_string(),
+                hooks::peers_url(&wiring.url, id, &token),
+            ));
+            session_env.push((
+                "MAROL_SEND_URL".to_string(),
+                hooks::send_url(&wiring.url, id, &token),
             ));
         }
 
