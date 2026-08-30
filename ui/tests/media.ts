@@ -173,6 +173,7 @@ export async function seedWorld(page: Page, locale: MediaLocale, k1Status: strin
         last_active_at: now - 45e3,
         live: true,
         reports_status: true,
+        hooks_wired: true,
         preview_port: null,
         activity: null,
         activity_since: now - 90e3,

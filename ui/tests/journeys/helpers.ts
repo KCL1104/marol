@@ -102,6 +102,7 @@ export function sessionShape(id: string, over: Partial<MockSession> = {}): MockS
     last_active_at: 1000,
     live: true,
     reports_status: true,
+    hooks_wired: true,
     preview_port: null,
     activity: null,
     activity_since: 0,

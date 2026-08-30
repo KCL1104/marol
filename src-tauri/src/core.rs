@@ -118,6 +118,20 @@ pub struct SessionMeta {
     /// True once the status plugin has reported at least once, so the UI can
     /// distinguish "idle" from "this CLI does not report status".
     pub reports_status: bool,
+    /// Whether this session's CLI was actually wired for status when it
+    /// launched.
+    ///
+    /// Not the same question as `reports_status`, and the difference is the
+    /// whole point: that one says "it has spoken", this one says "it was
+    /// given a mouth". A session with `hooks_wired` false will never report,
+    /// ever, and the card can say so at once instead of waiting out a
+    /// silence that has no end.
+    ///
+    /// Per session rather than per CLI because the answer is per *world*: a
+    /// distro's own codex may be new enough while this machine's is not, and
+    /// `host_env` probes each world's CLIs separately. A global "does codex
+    /// report" would be a fact about the wrong computer.
+    pub hooks_wired: bool,
     /// What the agent is doing right now, from the last `PreToolUse` report.
     pub activity: Option<Activity>,
     /// When that activity started, for an elapsed counter.
@@ -353,6 +367,7 @@ impl SessionMeta {
             last_active_at: s.last_active_at,
             live: false,
             reports_status: false,
+            hooks_wired: false,
             activity: None,
             activity_since: 0,
             completed: s.completed,
@@ -2255,6 +2270,7 @@ impl Core {
             last_active_at: at,
             live: true,
             reports_status: false,
+            hooks_wired: false,
             activity: None,
             activity_since: 0,
             completed: false,
@@ -2425,6 +2441,7 @@ impl Core {
             last_active_at: at,
             live: true,
             reports_status: false,
+            hooks_wired: false,
             activity: None,
             activity_since: 0,
             completed: false,
@@ -2768,6 +2785,7 @@ impl Core {
             last_active_at: at,
             live: true,
             reports_status: false,
+            hooks_wired: false,
             activity: None,
             activity_since: 0,
             completed: false,
@@ -2903,6 +2921,7 @@ impl Core {
             last_active_at: at,
             live: true,
             reports_status: false,
+            hooks_wired: false,
             activity: None,
             activity_since: 0,
             completed: false,
@@ -3915,6 +3934,7 @@ impl Core {
             last_active_at: at,
             live: true,
             reports_status: false,
+            hooks_wired: false,
             activity: None,
             activity_since: 0,
             completed: false,
@@ -4077,6 +4097,14 @@ impl Core {
             (Some(cli), Some(wiring)) if cli.hooks_ok(he.versions.of(cli)) => cli.hook_args(wiring),
             _ => Vec::new(),
         };
+
+        // Recorded, not inferred later: this is the moment the answer is
+        // known, and it is the only moment — the version that decided it
+        // belongs to the world this session launched into, and nothing
+        // downstream can see that world again.
+        if let Some(s) = self.sessions.lock().unwrap().get_mut(id) {
+            s.hooks_wired = !hook_args.is_empty();
+        }
 
         // Cross-session messaging addresses a session by name, and left to
         // itself the CLI derives one from the worktree's directory — a slug
@@ -5992,6 +6020,7 @@ mod tests {
             last_active_at: 0,
             live: true,
             reports_status: false,
+            hooks_wired: false,
             activity: None,
             activity_since: 0,
             completed: false,

@@ -189,7 +189,7 @@ test.describe('the first-run panel', () => {
           {
             id: 's9', cwd: '/Users/test/app', title: 'app', agent: 'claude',
             status: 'saved', created_at: 1, last_active_at: 1, live: false,
-            reports_status: false, activity: null, activity_since: 0,
+            reports_status: false, hooks_wired: true, activity: null, activity_since: 0,
             completed: false, attempt_id: null,
           },
         ]),
@@ -311,6 +311,21 @@ test.describe('settings', () => {
     await expect(page.getByTestId('sec-sessions')).toBeVisible();
     await page.getByTestId('sec-sessions').click();
     await expect(page.getByTestId('ckpt-toggle')).toBeVisible();
+  });
+
+  /**
+   * 這個設定的標籤原本寫「（Claude Code session）」,而那是錯的:快照掛
+   * 在 Stop hook 上,Codex 也發 Stop。一個 codex 使用者讀了那句話,會
+   * 關掉一個本來對他有效的功能 —— 或者從來不打開它。
+   */
+  test('the turn-end snapshot does not claim to be one CLI’s', async ({ page }) => {
+    await open(page);
+    await page.getByTestId('sec-sessions').click();
+    const body = page.getByTestId('settings-body');
+    await expect(body).toContainText('回合結束時自動快照');
+    await expect(body).not.toContainText('Claude Code session）');
+    // 說出真正的條件:會回報狀態的 agent,兩個都算。
+    await expect(body).toContainText('Codex');
   });
 
   test('a search that matches nothing says so rather than showing everything', async ({ page }) => {

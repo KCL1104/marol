@@ -725,17 +725,34 @@ function Card({
         {hasAttempt && <span className="muted small mono"> #{live.attempt.seq}</span>}
         {/* Hooks belong to the CLIs that have them; for anyone else
             「安靜」 must never be read as 「沒事」— the absence of signal is
-            itself the signal. A measured CLI is expected to report, so it
-            never wears this: a disclaimer that appears for a second and then
-            withdraws itself on the first hook is a flicker on the one
-            surface whose job is to be believed at a glance. */}
-        {live.kind === 'session' &&
-          !live.session.reports_status &&
-          !isMeasured(live.attempt.agent) && (
-            <span className="chip no-signal" data-testid={`nosignal-${task.id}`}>
-              {t('env.cliQuiet')}
-            </span>
-          )}
+            itself the signal.
+
+            The gate is `hooks_wired`, not `isMeasured`. Being measured only
+            means this desk knows how to wire that CLI in principle; whether
+            it *got* wired is a fact about the session — the world's own
+            binary may be older than the release that grew a hooks engine, or
+            the world may have no listener at all. A codex too old for hooks
+            used to be treated as "measured, therefore expected to report",
+            so it wore nothing and a card that would never say a word was
+            indistinguishable from one working quietly. That is the one
+            reading this surface must never allow.
+
+            Still no flicker, which is what the old gate was protecting: an
+            unwired session never reports, so the chip cannot withdraw
+            itself. A wired one never shows it, even before its first hook. */}
+        {live.kind === 'session' && !live.session.reports_status && !live.session.hooks_wired && (
+          <span
+            className="chip no-signal"
+            data-testid={`nosignal-${task.id}`}
+            title={
+              isMeasured(live.attempt.agent)
+                ? t('env.cliQuietWhy', { agent: live.attempt.agent })
+                : t('env.cliQuietUnmeasured', { agent: live.attempt.agent })
+            }
+          >
+            {t('env.cliQuiet')}
+          </span>
+        )}
         {/* How long it has been stuck — the number triage runs on, on the
             surface triage happens on, not only in the sidebar. Based on the
             last report, which for a blocked card is the moment it blocked. */}

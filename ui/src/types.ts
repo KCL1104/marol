@@ -148,6 +148,11 @@ export interface SessionMeta {
   /** True once the status plugin has reported, so the UI can tell "idle" from
       "this CLI does not report status". */
   reports_status: boolean;
+  /** Whether this session's CLI was wired for status at launch. `reports_status`
+      says it has spoken; this says it was given a mouth. False means it never
+      will, so a card can say so at once rather than waiting out a silence with
+      no end. Per session because the answer is per world — see core.rs. */
+  hooks_wired: boolean;
   /** The attempt this session runs, or `null` for an ad-hoc session that
       lives outside the board. */
   attempt_id: string | null;

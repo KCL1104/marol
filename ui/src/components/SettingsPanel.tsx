@@ -327,6 +327,13 @@ export function SettingsPanel({
                   label={t('env.codex')}
                   value={cliLine(boot.codex, boot.codexVersion, reports(boot, 'codex'), t)}
                 />
+                {/* Two facts about Codex a person can only otherwise learn by
+                    being confused first. Both are Codex's, not this desk's,
+                    and neither is a defect to be fixed here — which is
+                    exactly why they belong in writing rather than in a
+                    workaround. */}
+                {boot.codex && <Note testid="note-codex">{t('note.codexTrust')}</Note>}
+                {boot.codex && <Note testid="note-codex-idle">{t('note.codexIdle')}</Note>}
                 {/* Whether cards' agents can message each other. The feature
                     is the CLI's own; what this desk adds is naming each
                     session after its card so messages have somewhere to go. */}
@@ -335,7 +342,13 @@ export function SettingsPanel({
                   value={
                     boot.messaging
                       ? `✓ · claude ${boot.claudeVersion ?? ''}`.trim()
-                      : t('env.messagingOff', { version: boot.claudeVersion ?? '—' })
+                      : boot.claude
+                        ? t('env.messagingOld', { version: boot.claudeVersion ?? '—' })
+                        : // No claude here at all. "Needs Claude Code >= 2.1.224
+                          // (found —)" reads as a chore, and it is not one: a
+                          // desk that runs codex is not missing anything it
+                          // asked for. Name whose feature it is and stop.
+                          t('env.messagingNoClaude')
                   }
                 />
                 <Stat label={t('env.db')} value={boot.db ?? '—'} />
@@ -707,6 +720,11 @@ function Checkpoints() {
         />
         {t('ckpt.onStop')}
       </label>
+      {/* Which agents this reaches. The label used to answer that in a
+          parenthetical, and answered it wrongly — the snapshot hangs off the
+          Stop hook, and Codex fires Stop. Naming both is what stops a Codex
+          user reading a working feature as somebody else's. */}
+      <p className="muted small">{t('ckpt.onStopHint')}</p>
     </div>
   );
 }
