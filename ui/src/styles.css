@@ -127,7 +127,11 @@ body {
   min-width: 18px; min-height: 18px;
   display: inline-flex; align-items: center; justify-content: center;
 }
-button.icon { min-height: 18px; }
+/* `.head-fold` rides every `button.icon` rule but is deliberately not one.
+   `.sidebar-head button.icon` is how sixteen test files say "the + button",
+   and a second `.icon` in that header turns each of them into a strict-mode
+   violation. The class is the difference; the look is not. */
+button.icon, .head-fold { min-height: 18px; }
 
 /* A chip is a chip whatever element carries it — the PATH entries in the
    env panel are spans, and unstyled they fuse into one bogus path. */
@@ -159,7 +163,7 @@ button:disabled { opacity: 0.4; cursor: default; }
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
 button.primary:hover:not(:disabled) { filter: brightness(1.08); }
 button.danger { border-color: color-mix(in srgb, var(--err) 35%, var(--bg-3)); color: var(--err); }
-button.icon { padding: 2px 8px; font-size: var(--fs-glyph); line-height: 1; }
+button.icon, .head-fold { padding: 2px 8px; font-size: var(--fs-glyph); line-height: 1; }
 
 input, textarea, select {
   background: var(--bg);
@@ -179,6 +183,13 @@ textarea { resize: vertical; }
   grid-template-columns: 220px 1fr;
   height: 100%;
 }
+/* Folded to the rail. No transition on the track, on purpose: the second
+   column holds the terminals, and every frame of an animated width would be
+   a resize the TUI inside each one has to answer by reflowing. The pane's
+   own ResizeObserver settles for 80ms before telling the PTY, so an
+   animation would cost 60 layouts to deliver the one SIGWINCH a jump
+   delivers. */
+.app.sidebar-folded { grid-template-columns: 36px 1fr; }
 
 .sidebar {
   border-right: 1px solid var(--line);
@@ -200,6 +211,37 @@ textarea { resize: vertical; }
   font-size: var(--fs-label); letter-spacing: 0.08em; color: var(--fg-dim);
   border-bottom: 1px solid var(--line);
 }
+/* The head's right end: + and «, kept together so space-between still has
+   exactly two children and the title stays hard left. */
+.head-actions { display: flex; align-items: center; gap: 2px; }
+
+/* ---------- the rail ----------
+   What is left when the sidebar folds: the way back, and the one number.
+   Nothing else renders — no rows, no sections, and no elapsed timer. */
+.sidebar.folded {
+  align-items: center;
+  gap: 6px;
+  padding-top: 8px;
+}
+.rail-btn, .rail-waiting {
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+  width: 28px; padding: 4px 0;
+  border: none; border-radius: var(--radius-xs); background: transparent;
+  color: var(--fg-dim); font-size: var(--fs-label); line-height: 1;
+}
+.rail-btn:hover:not(:disabled),
+.rail-waiting:hover:not(:disabled) {
+  color: var(--fg);
+  background: color-mix(in srgb, var(--fg) 4%, var(--bg-2));
+}
+/* The count wears the same --warn the banner does — folding the list away
+   must not quietly downgrade what it was saying. */
+.rail-waiting { color: var(--warn); }
+.rail-waiting:hover:not(:disabled) {
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 12%, var(--bg-2));
+}
+.rail-count { font-variant-numeric: tabular-nums; }
 /* The one child that may overflow, clipping itself. min-height: 0 says out
    loud what the overflow value already implied: this flex item may shrink. */
 .session-groups { flex: 1; min-height: 0; overflow: hidden auto; }

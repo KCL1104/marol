@@ -257,3 +257,110 @@ test.describe('naming a session', () => {
     await expect(page.locator('[data-testid="session-s1"] .row-title')).toHaveText('repo-one');
   });
 });
+
+/**
+ * 收起側欄。
+ *
+ * 借的是每個有側欄的編輯器都有的那顆鍵(⌘/Ctrl+B),但這裡的收起不是
+ * 「藏起來」:摺完剩一條軌,軌上留兩樣東西 —— 回去的路,以及「幾個在
+ * 等你」。第一樣是因為只能用快捷鍵離開的狀態會把人關在裡面;第二樣是
+ * 因為那個數字是這個 app 存在的理由,把清單收起來不該連它一起收掉。
+ *
+ * 另一半是效能:摺起來時每一列、每一段、還有那個一秒一次的計時器都
+ * 真的卸載,不是用 CSS 藏起來。這條由「計時器停了」釘住。
+ */
+test.describe('folding the sidebar', () => {
+  test('the fold leaves a rail with the way back on it, and remembers itself', async ({ page }) => {
+    await boot(page);
+    await newSession(page, '/Users/test/repo-one');
+    await expect(page.getByTestId('session-s1')).toBeVisible();
+
+    await page.getByTestId('sidebar-fold').click();
+
+    // 列真的不見了 —— 不是被切掉的可視範圍。
+    await expect(page.getByTestId('session-s1')).toHaveCount(0);
+    await expect(page.locator('.app')).toHaveClass(/sidebar-folded/);
+    // 回去的路一定在:只能用快捷鍵離開的狀態,是把人關起來。
+    await expect(page.getByTestId('sidebar-unfold')).toBeVisible();
+
+    // 跨重開機記得,和世界選擇器同一條規矩。
+    await page.reload();
+    await expect(page.getByTestId('sidebar-unfold')).toBeVisible();
+    await expect(page.getByTestId('session-s1')).toHaveCount(0);
+
+    await page.getByTestId('sidebar-unfold').click();
+    await expect(page.getByTestId('session-s1')).toBeVisible();
+    await expect(page.locator('.app')).not.toHaveClass(/sidebar-folded/);
+  });
+
+  test('⌘/Ctrl+B folds it, and the terminal keeps plain Ctrl+B for readline', async ({ page }) => {
+    await boot(page);
+    await newSession(page, '/Users/test/repo-one');
+
+    // 開完 session,焦點就在那個終端機裡 —— 在裡面,Ctrl+B 是 readline
+    // 的 backward-char,不是我們的。這一按必須什麼都不做。
+    //
+    // 這裡刻意寫死 Control 而不是 ControlOrMeta:被讓出去的那顆是 Ctrl,
+    // 每個平台都一樣,因為 readline 讀的是 Ctrl。在 mac 上 ControlOrMeta
+    // 會變成 ⌘,而 ⌘B 從來就不是 shell 的 —— 它該收側欄,底下那一按就是
+    // 在講這件事。
+    await page.keyboard.press('Control+b');
+    await expect(page.getByTestId('session-s1')).toBeVisible();
+
+    // shell 沒在讀的修飾鍵,終端機裡外都是我們的。
+    await page.keyboard.press('Meta+b');
+    await expect(page.getByTestId('sidebar-unfold')).toBeVisible();
+    await page.getByTestId('sidebar-unfold').click();
+    await expect(page.getByTestId('session-s1')).toBeVisible();
+    await page.locator('.term-host').first().click();
+
+    // 加 Shift 才是這個 app 的那一顆,與 E/L/F/I 同一條規則。
+    await page.keyboard.press('ControlOrMeta+Shift+B');
+    await expect(page.getByTestId('sidebar-unfold')).toBeVisible();
+
+    // 展開後那顆鈕自己卸載,焦點落回 body —— 也就是終端機外面,
+    // 素的那一顆在這裡才是我們的。
+    await page.getByTestId('sidebar-unfold').click();
+    await expect(page.getByTestId('session-s1')).toBeVisible();
+    await page.keyboard.press('ControlOrMeta+b');
+    await expect(page.getByTestId('sidebar-unfold')).toBeVisible();
+  });
+
+  test('the one number survives the fold, and still cycles', async ({ page }) => {
+    await boot(page);
+    await newSession(page, '/Users/test/repo-one');
+    await newSession(page, '/Users/test/repo-two');
+    await report(page, 's1', 'waiting_input');
+    await report(page, 's2', 'waiting_permission');
+    await expect(page.locator('.waiting-banner')).toContainText('2');
+
+    await page.getByTestId('sidebar-fold').click();
+    // 收起清單不該連「幾個在等你」一起收掉 —— 那是這張桌子的重點。
+    await expect(page.getByTestId('rail-waiting')).toContainText('2');
+    // 而且和橫幅一樣是輪替,不是跳到同一個:答完一個按下一次就是下一個。
+    await page.getByTestId('rail-waiting').click();
+    await expect(page.locator('.pane.focused')).toHaveAttribute('data-session-id', 's1');
+    await page.getByTestId('rail-waiting').click();
+    await expect(page.locator('.pane.focused')).toHaveAttribute('data-session-id', 's2');
+  });
+
+  test('a folded sidebar stops the once-a-second timer', async ({ page }) => {
+    await page.clock.install();
+    await boot(page);
+    await newSession(page, '/Users/test/repo-one');
+    // 有活動的列才有計秒 —— 計時器的存在條件就是它。
+    await report(page, 's1', 'running', { tool: 'Bash', detail: 'npm test' });
+    await expect(page.locator('[data-testid="session-s1"] .row-elapsed')).toBeVisible();
+
+    await page.clock.runFor(3000);
+    const ticking = await page.locator('[data-testid="session-s1"] .row-elapsed').textContent();
+    expect(ticking).not.toBe('0s');
+
+    // 摺起來:列卸載,計時器跟著走。展開後從當下重新開始數,而不是
+    // 從一個在背景空轉了整段時間的時鐘接手。
+    await page.getByTestId('sidebar-fold').click();
+    await page.clock.runFor(60_000);
+    await page.getByTestId('sidebar-unfold').click();
+    await expect(page.locator('[data-testid="session-s1"] .row-elapsed')).toBeVisible();
+  });
+});

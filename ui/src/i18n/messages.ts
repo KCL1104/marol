@@ -117,6 +117,10 @@ export const en = {
   // sentence — the same arrangement the tab strip's own rename uses.
   'sidebar.rename': 'Session name',
   'sidebar.renameHint': 'Rename (F2)',
+  // Both directions get their own sentence rather than one "Toggle sidebar":
+  // the button says what the click will do, which is the half a person needs.
+  'sidebar.fold': 'Collapse the sidebar',
+  'sidebar.unfold': 'Expand the sidebar',
 
   /* ---------------------------- overview ------------------------------ */
   'overview.noAction': 'Nothing in progress',
@@ -143,6 +147,14 @@ export const en = {
   'keys.cyclePanes': 'Next / previous pane',
   'keys.moveCard': 'Move the focused card',
   'keys.cycleTabs': 'Next / previous tab',
+  'keys.sidebar': 'Collapse / expand the sidebar',
+  'keys.agentOwn': 'The agent’s own view',
+  // Named as what it holds rather than what it is called, because "transcript
+  // overlay" is the CLI's word and "everything said so far" is the question.
+  'keys.codexTranscript': 'Everything said so far, in a view you can scroll',
+  'keys.codexPager': 'Move around inside it (q closes)',
+  'keys.agentOwnNote':
+    'These belong to the CLI, not to Marol, so Marol cannot change them. The wheel scrolls whatever the agent on screen calls scrolling.',
   'keys.inspector': 'Toggle the inspector',
   'keys.escape': 'Close the dialog',
   'keys.shellNote': 'Inside a terminal, Marol’s shortcuts take Shift: Ctrl+Shift+E, not Ctrl+E.',
@@ -363,6 +375,7 @@ export const en = {
   'inspector.worktreeGroup': 'worktree',
   'inspector.shell': 'shell',
   'inspector.queued': 'A message will send when this turn ends',
+  'inspector.queuedFrom': '{who} is waiting for this turn to end',
   'timeline.waited': '· held {for}',
 
   /* ----------------------------- review ------------------------------- */
@@ -391,6 +404,16 @@ export const en = {
   // too old to be wired runs perfectly well and tells this desk nothing.
   'env.cliReports': 'status ✓',
   'env.cliQuiet': 'no status',
+  // The chip's tooltip. Two different silences, and the difference is what a
+  // person can do about it: one is a version, the other is the CLI itself.
+  'env.cliQuietWhy':
+    'This {agent} is not wired for status — the version in this world is older than the release that added hooks. Cards for it show no activity.',
+  'env.cliQuietUnmeasured':
+    'Marol does not know how to read status out of {agent}. The session is real; the card simply cannot say what it is doing.',
+  'note.codexTrust':
+    'Codex will not run a hook it has not been shown, so the first Codex session on this machine reports nothing until you answer /hooks in its terminal — and until then it is also not told how to message the other sessions, which its SessionStart hook is what carries. Marol passes the same hook definition every time, so it is asked once.',
+  'note.codexIdle':
+    'Codex has no idle-prompt event, so a finished Codex turn reads as idle rather than waiting on you. Marol does not invent the state Codex cannot report.',
   'env.db': 'database',
   'env.version': 'this build',
   'env.degraded':
@@ -435,7 +458,11 @@ export const en = {
   'up.newVersion': 'Marol {version} available',
   'env.language': 'Language',
   'env.messaging': 'Cross-session messaging',
-  'env.messagingOff': 'needs Claude Code ≥ 2.1.224 (found {version})',
+  // Was one string for two very different readers. Someone running Claude
+  // Code has a version to act on; someone running only Codex is not missing
+  // anything they asked for, and should not be handed a chore.
+  'env.messagingOld': 'needs Claude Code ≥ 2.1.224 (found {version})',
+  'env.messagingNoClaude': 'a Claude Code feature — no claude on this desk',
   'env.profiles': 'Agent profiles',
   'env.profilesHint': 'A CLI plus the flags it always gets.',
   'env.notifications': 'Notifications',
@@ -458,7 +485,11 @@ export const en = {
   // Every clause is a guarantee about what is touched and what is not.
   'ckpt.hint':
     'Kept in private git refs and deleted when the attempt ends. Your branches, index and stash are never touched.',
-  'ckpt.onStop': 'Snapshot when a turn ends (Claude Code sessions)',
+  // The parenthetical used to say "(Claude Code sessions)" and was simply
+  // wrong: the snapshot hangs off the Stop hook, and Codex fires Stop. It
+  // cost a Codex user a working feature they read as not theirs.
+  'ckpt.onStop': 'Snapshot when a turn ends',
+  'ckpt.onStopHint': 'Any agent that reports status — Claude Code and Codex both do.',
   'inspector.ckpt': 'Checkpoint',
   'inspector.ckptHint': 'Snapshot this worktree now',
   'inspector.ckptMade': 'Checkpoint #{n} ✓',
@@ -650,6 +681,8 @@ export const zhTW: Record<MessageKey, string> = {
   'sidebar.removeFromList': '從清單移除',
   'sidebar.rename': 'session 名稱',
   'sidebar.renameHint': '改名（F2）',
+  'sidebar.fold': '收起側欄',
+  'sidebar.unfold': '展開側欄',
 
   /* ---------------------------- overview ------------------------------ */
   'overview.noAction': '沒有進行中的動作',
@@ -674,6 +707,12 @@ export const zhTW: Record<MessageKey, string> = {
   'keys.cyclePanes': '下一個 / 上一個窗格',
   'keys.moveCard': '搬動聚焦的卡片',
   'keys.cycleTabs': '下一個 / 上一個分頁',
+  'keys.sidebar': '收起 / 展開側欄',
+  'keys.agentOwn': 'agent 自己的畫面',
+  'keys.codexTranscript': '目前為止說過的全部，在一個可以捲動的畫面裡',
+  'keys.codexPager': '在裡面移動（q 關閉）',
+  'keys.agentOwnNote':
+    '這些鍵屬於 CLI 不屬於 Marol，Marol 改不動它們。滾輪捲動的是畫面上那個 agent 自己認定的捲動。',
   'keys.inspector': '開關檢視器',
   'keys.escape': '關閉對話框',
   'keys.shellNote': '在終端機內，Marol 的快捷鍵需加 Shift：Ctrl+Shift+E，不是 Ctrl+E。',
@@ -873,6 +912,7 @@ export const zhTW: Record<MessageKey, string> = {
   'inspector.worktreeGroup': 'worktree',
   'inspector.shell': 'shell',
   'inspector.queued': '一則訊息會在這個回合結束後送出',
+  'inspector.queuedFrom': '{who} 正在等這個回合結束',
   'timeline.waited': '· 等候 {for}',
 
   /* ----------------------------- review ------------------------------- */
@@ -897,6 +937,14 @@ export const zhTW: Record<MessageKey, string> = {
   'env.cliMissing': '找不到',
   'env.cliReports': '狀態回報 ✓',
   'env.cliQuiet': '沒有狀態回報',
+  'env.cliQuietWhy':
+    '這個世界裡的 {agent} 沒有被接上狀態回報 —— 版本比長出 hooks 的那一版舊。它的卡片不會顯示任何活動。',
+  'env.cliQuietUnmeasured':
+    'Marol 不知道怎麼從 {agent} 讀出狀態。session 是真的，只是卡片說不出它在做什麼。',
+  'note.codexTrust':
+    'Codex 不會執行沒給它看過的 hook，所以這台機器上第一個 Codex session 在你於它的終端機裡回答 /hooks 之前不會回報任何東西 —— 在那之前它也不會被告知怎麼跟其他 session 傳訊，那是它的 SessionStart hook 帶的。Marol 每次都送同一份 hook 定義，所以只會被問一次。',
+  'note.codexIdle':
+    'Codex 沒有 idle-prompt 事件，所以結束的 Codex 回合讀起來是「待命」而不是「等你」。Codex 回報不了的狀態，Marol 不會替它發明。',
   'env.db': '資料庫',
   'env.version': '目前版本',
   'env.degraded':
@@ -934,7 +982,8 @@ export const zhTW: Record<MessageKey, string> = {
   'up.newVersion': 'Marol {version} 可更新',
   'env.language': '語言',
   'env.messaging': '跨 session 互傳訊息',
-  'env.messagingOff': '需要 Claude Code ≥ 2.1.224（目前 {version}）',
+  'env.messagingOld': '需要 Claude Code ≥ 2.1.224（目前 {version}）',
+  'env.messagingNoClaude': '這是 Claude Code 自己的功能 —— 這張桌子上沒有 claude',
   'env.profiles': 'Agent 設定檔',
   'env.profilesHint': '一個 CLI，加上固定帶的參數。',
   'env.notifications': '通知',
@@ -955,7 +1004,8 @@ export const zhTW: Record<MessageKey, string> = {
   'env.checkpoints': '檢查點',
   'ckpt.hint':
     '存在私有 git ref 裡，attempt 結束即刪。不動你的分支、index 與 stash。',
-  'ckpt.onStop': '回合結束時自動快照（Claude Code session）',
+  'ckpt.onStop': '回合結束時自動快照',
+  'ckpt.onStopHint': '任何會回報狀態的 agent 都適用 —— Claude Code 和 Codex 都會。',
   'inspector.ckpt': '檢查點',
   'inspector.ckptHint': '立即快照這個 worktree',
   'inspector.ckptMade': '檢查點 #{n} ✓',

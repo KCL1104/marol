@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agent;
+mod channel;
 mod config;
 mod core;
 mod host;
@@ -196,6 +197,41 @@ impl AppState {
 /* Commands                                                            */
 /* ------------------------------------------------------------------ */
 
+/// Run a command's real work off the thread the window is drawn on.
+///
+/// **A synchronous `#[tauri::command]` runs its whole body on the main
+/// thread.** Not a detail: `tauri-macros` picks `body_blocking` for any `fn`
+/// without `async`, and on Windows the WebView2 handler carrying an invoke
+/// fires on the thread that created the controller. So a command that takes
+/// 300ms is 300ms in which the window does not repaint, input is not
+/// processed, and the terminal output this app `emit`s cannot reach the
+/// webview.
+///
+/// Locally that never showed, because locally these calls are `std::fs` and
+/// cost microseconds. Behind a doorway every one of them is a *process* —
+/// `wsl.exe` or `ssh` — and the board asks for several per open attempt on a
+/// timer. That is why a WSL card felt like a hung app while a local card felt
+/// fine: the same code, three orders of magnitude apart.
+///
+/// `spawn_blocking`, deliberately, and not `#[tauri::command(async)]`. That
+/// attribute hands the still-synchronous body to `async_runtime::spawn`,
+/// which parks it on a tokio *worker* — and the hook listener every agent
+/// reports to lives on that same runtime. Blocking those workers would let a
+/// board refresh stall the hook calls agents are waiting on, which is the
+/// worse bug: a slow desk would have become a slow agent.
+///
+/// What stays synchronous, and why, is pinned by the test at the foot of this
+/// file rather than left to memory.
+async fn blocking<T, F>(f: F) -> StdResult<T, String>
+where
+    F: FnOnce() -> StdResult<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("that call could not be run: {e}"))?
+}
+
 #[tauri::command]
 fn set_locale(app: AppHandle, state: State<'_, AppState>, locale: String) -> StdResult<(), String> {
     // Best-effort: the language is a display preference, so a call that lands
@@ -269,7 +305,7 @@ fn boot_status(state: State<'_, AppState>) -> serde_json::Value {
 }
 
 #[tauri::command]
-fn new_session(
+async fn new_session(
     state: State<'_, AppState>,
     cwd: String,
     agent: Option<String>,
@@ -277,9 +313,9 @@ fn new_session(
     cols: u16,
     rows: u16,
 ) -> StdResult<String, String> {
-    state
-        .core()?
-        .new_session(
+    let core = state.core()?;
+    blocking(move || {
+        core.new_session(
             cwd,
             agent.unwrap_or_else(|| "claude".into()),
             args.unwrap_or_default(),
@@ -287,22 +323,35 @@ fn new_session(
             rows,
         )
         .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-fn reopen_session(
+async fn reopen_session(
     state: State<'_, AppState>,
     id: String,
     cols: u16,
     rows: u16,
 ) -> StdResult<(), String> {
-    state
-        .core()?
-        .reopen_session(&id, cols, rows)
+    let core = state.core()?;
+    blocking(move || {
+        core.reopen_session(&id, cols, rows)
         .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Keystrokes from xterm.js, forwarded to the PTY verbatim.
+///
+/// **Deliberately synchronous, and it is the one place where that matters.**
+/// A keystroke is a write to a pipe this process already holds open — no
+/// doorway, no process, microseconds — so there is nothing here to move off
+/// the main thread. Moving it would cost the one guarantee typing has:
+/// `spawn_blocking` tasks are not ordered against each other, so two quick
+/// keys could reach the PTY reversed. `term_resize` stays for the same
+/// reason — a resize that overtook the keys before it would reflow the TUI
+/// around the wrong buffer.
 #[tauri::command]
 fn term_write(state: State<'_, AppState>, id: String, data: String) -> StdResult<(), String> {
     state.core()?.write(&id, &data).map_err(|e| e.to_string())
@@ -329,8 +378,9 @@ fn term_snapshot(state: State<'_, AppState>, id: String) -> StdResult<serde_json
 }
 
 #[tauri::command]
-fn close_session(state: State<'_, AppState>, id: String) -> StdResult<(), String> {
-    state.core()?.close_session(&id).map_err(|e| e.to_string())
+async fn close_session(state: State<'_, AppState>, id: String) -> StdResult<(), String> {
+    let core = state.core()?;
+    blocking(move || core.close_session(&id).map_err(|e| e.to_string())).await
 }
 
 /// Mark a session done, or undo it. See `Core::set_completed`.
@@ -343,8 +393,9 @@ fn set_completed(state: State<'_, AppState>, id: String, completed: bool) -> Std
 }
 
 #[tauri::command]
-fn archive_session(state: State<'_, AppState>, id: String) -> StdResult<(), String> {
-    state.core()?.archive_session(&id).map_err(|e| e.to_string())
+async fn archive_session(state: State<'_, AppState>, id: String) -> StdResult<(), String> {
+    let core = state.core()?;
+    blocking(move || core.archive_session(&id).map_err(|e| e.to_string())).await
 }
 
 /// Rename a session's row. The same door the agent's own naming goes through
@@ -408,7 +459,7 @@ fn list_tasks(state: State<'_, AppState>) -> StdResult<Vec<crate::core::TaskView
 /// several. Absent is the ordinary card, and every caller written before this
 /// existed keeps working unchanged.
 #[tauri::command]
-fn create_task(
+async fn create_task(
     state: State<'_, AppState>,
     title: String,
     prompt: String,
@@ -416,9 +467,9 @@ fn create_task(
     base_branch: String,
     extra_repos: Option<Vec<store::TaskRepo>>,
 ) -> StdResult<String, String> {
-    state
-        .core()?
-        .create_task(
+    let core = state.core()?;
+    blocking(move || {
+        core.create_task(
             title,
             prompt,
             repo_path,
@@ -426,12 +477,14 @@ fn create_task(
             extra_repos.unwrap_or_default(),
         )
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 /// Move a card between columns, or reorder it within one. Only a drag calls
 /// this — see `Core::move_task`.
 #[tauri::command]
-fn move_task(
+async fn move_task(
     state: State<'_, AppState>,
     id: String,
     lifecycle: String,
@@ -439,15 +492,18 @@ fn move_task(
 ) -> StdResult<(), String> {
     let lifecycle = store::Lifecycle::parse(&lifecycle)
         .ok_or_else(|| format!("unknown lifecycle: {lifecycle}"))?;
-    state
-        .core()?
-        .move_task(&id, lifecycle, position)
+    let core = state.core()?;
+    blocking(move || {
+        core.move_task(&id, lifecycle, position)
         .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-fn delete_task(state: State<'_, AppState>, id: String) -> StdResult<(), String> {
-    state.core()?.delete_task(&id).map_err(|e| format!("{e:#}"))
+async fn delete_task(state: State<'_, AppState>, id: String) -> StdResult<(), String> {
+    let core = state.core()?;
+    blocking(move || core.delete_task(&id).map_err(|e| format!("{e:#}"))).await
 }
 
 /* ---------------------------- attempts ----------------------------- */
@@ -455,22 +511,24 @@ fn delete_task(state: State<'_, AppState>, id: String) -> StdResult<(), String> 
 /// The first message as it would be sent, for the dialog to show and let the
 /// person edit before any worktree is created.
 #[tauri::command]
-fn preview_prompt(
+async fn preview_prompt(
     state: State<'_, AppState>,
     task_id: String,
     agent: String,
 ) -> StdResult<serde_json::Value, String> {
-    state
-        .core()?
-        .preview_prompt(&task_id, &agent)
+    let core = state.core()?;
+    blocking(move || {
+        core.preview_prompt(&task_id, &agent)
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 /// Start an attempt, or queue it when every slot is taken. `mode` is the
 /// permission mode the dialog offered — parsed leniently, because an unknown
 /// value must degrade to asking, never to not asking.
 #[tauri::command]
-fn open_attempt(
+async fn open_attempt(
     state: State<'_, AppState>,
     task_id: String,
     agent: Option<String>,
@@ -479,9 +537,9 @@ fn open_attempt(
     cols: u16,
     rows: u16,
 ) -> StdResult<crate::core::StartResult, String> {
-    state
-        .core()?
-        .start_attempt(
+    let core = state.core()?;
+    blocking(move || {
+        core.start_attempt(
             &task_id,
             agent.unwrap_or_else(|| "claude".into()),
             prompt,
@@ -490,93 +548,111 @@ fn open_attempt(
             rows,
         )
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 #[tauri::command]
-fn cancel_queued(state: State<'_, AppState>, task_id: String) -> StdResult<(), String> {
-    state.core()?.cancel_queued(&task_id).map_err(|e| e.to_string())
+async fn cancel_queued(state: State<'_, AppState>, task_id: String) -> StdResult<(), String> {
+    let core = state.core()?;
+    blocking(move || core.cancel_queued(&task_id).map_err(|e| e.to_string())).await
 }
 
 /// How many attempts may hold a terminal at once. The thing being rationed
 /// is a person's attention, not a machine.
 #[tauri::command]
-fn concurrency(state: State<'_, AppState>) -> StdResult<serde_json::Value, String> {
+async fn concurrency(state: State<'_, AppState>) -> StdResult<serde_json::Value, String> {
     let core = state.core()?;
-    Ok(serde_json::json!({
-        "max": core.max_concurrent(),
-        "running": core.running_attempts(),
-        "queued": core.queue().len(),
-    }))
+    blocking(move || {
+        Ok(serde_json::json!({
+            "max": core.max_concurrent(),
+            "running": core.running_attempts(),
+            "queued": core.queue().len(),
+        }))
+    })
+    .await
 }
 
 #[tauri::command]
-fn set_concurrency(state: State<'_, AppState>, max: i64) -> StdResult<(), String> {
-    state.core()?.set_max_concurrent(max).map_err(|e| e.to_string())
+async fn set_concurrency(state: State<'_, AppState>, max: i64) -> StdResult<(), String> {
+    let core = state.core()?;
+    blocking(move || core.set_max_concurrent(max).map_err(|e| e.to_string())).await
 }
 
 /// Fold the attempt's branch back into its base, then close it out.
 #[tauri::command]
-fn merge_attempt(state: State<'_, AppState>, attempt_id: String) -> StdResult<String, String> {
-    state
-        .core()?
-        .merge_attempt(&attempt_id)
+async fn merge_attempt(state: State<'_, AppState>, attempt_id: String) -> StdResult<String, String> {
+    let core = state.core()?;
+    blocking(move || {
+        core.merge_attempt(&attempt_id)
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 /// Push the branch and open a pull request. The attempt stays open: review is
 /// exactly when there is still something to change.
 #[tauri::command]
-fn open_pr(state: State<'_, AppState>, attempt_id: String) -> StdResult<String, String> {
-    state.core()?.open_pr(&attempt_id).map_err(|e| format!("{e:#}"))
+async fn open_pr(state: State<'_, AppState>, attempt_id: String) -> StdResult<String, String> {
+    let core = state.core()?;
+    blocking(move || core.open_pr(&attempt_id).map_err(|e| format!("{e:#}"))).await
 }
 
 /// Put a terminal back on an attempt that is not running — the state every
 /// attempt is in after a restart.
 #[tauri::command]
-fn reopen_attempt(
+async fn reopen_attempt(
     state: State<'_, AppState>,
     attempt_id: String,
     cols: u16,
     rows: u16,
 ) -> StdResult<String, String> {
-    state
-        .core()?
-        .reopen_attempt(&attempt_id, cols, rows)
+    let core = state.core()?;
+    blocking(move || {
+        core.reopen_attempt(&attempt_id, cols, rows)
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 /// End an attempt: freeze its diff, then give the worktree back.
 #[tauri::command]
-fn finish_attempt(
+async fn finish_attempt(
     state: State<'_, AppState>,
     attempt_id: String,
     outcome: String,
 ) -> StdResult<(), String> {
     let outcome =
         store::Outcome::parse(&outcome).ok_or_else(|| format!("unknown outcome: {outcome}"))?;
-    state
-        .core()?
-        .finish_attempt(&attempt_id, outcome)
+    let core = state.core()?;
+    blocking(move || {
+        core.finish_attempt(&attempt_id, outcome)
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 /// Send a later message into an attempt's live terminal — the review drawer's
 /// way of saying what is still wrong without leaving the diff.
 #[tauri::command]
-fn send_followup(state: State<'_, AppState>, id: String, text: String) -> StdResult<(), String> {
-    state
-        .core()?
-        .send_followup(&id, &text)
+async fn send_followup(state: State<'_, AppState>, id: String, text: String) -> StdResult<(), String> {
+    let core = state.core()?;
+    blocking(move || {
+        core.send_followup(&id, &text)
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 /// Hold a message for the end of this turn — sent when Stop lands.
 #[tauri::command]
-fn queue_followup(state: State<'_, AppState>, id: String, text: String) -> StdResult<(), String> {
-    state
-        .core()?
-        .queue_followup(&id, &text)
+async fn queue_followup(state: State<'_, AppState>, id: String, text: String) -> StdResult<(), String> {
+    let core = state.core()?;
+    blocking(move || {
+        core.queue_followup(&id, &text)
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -587,48 +663,55 @@ fn cancel_followup(state: State<'_, AppState>, id: String) -> StdResult<(), Stri
 
 /// The repository's branches, recency first, for the base picker.
 #[tauri::command]
-fn list_branches(
+async fn list_branches(
     state: State<'_, AppState>,
     repo_path: String,
 ) -> StdResult<Vec<String>, String> {
-    state
-        .core()?
-        .list_branches(&repo_path)
+    let core = state.core()?;
+    blocking(move || {
+        core.list_branches(&repo_path)
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 /// The rules and skills an agent working in this directory will read —
 /// every supported CLI's convention, present or not.
 #[tauri::command]
-fn agent_docs(state: State<'_, AppState>, cwd: String) -> StdResult<Vec<core::AgentDoc>, String> {
-    state.core()?.agent_docs(&cwd).map_err(|e| format!("{e:#}"))
+async fn agent_docs(state: State<'_, AppState>, cwd: String) -> StdResult<Vec<core::AgentDoc>, String> {
+    let core = state.core()?;
+    blocking(move || core.agent_docs(&cwd).map_err(|e| format!("{e:#}"))).await
 }
 
 /// The attempt's diff — against its base, or, when `n` names a checkpoint,
 /// against that snapshot instead.
 #[tauri::command]
-fn attempt_diff(
+async fn attempt_diff(
     state: State<'_, AppState>,
     attempt_id: String,
     n: Option<u64>,
 ) -> StdResult<String, String> {
-    state
-        .core()?
-        .attempt_diff_from(&attempt_id, n)
+    let core = state.core()?;
+    blocking(move || {
+        core.attempt_diff_from(&attempt_id, n)
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 /// Numstat counts and ahead/behind for an open attempt — the board's card
 /// badges, cheap enough to ask for on a timer.
 #[tauri::command]
-fn attempt_stats(
+async fn attempt_stats(
     state: State<'_, AppState>,
     attempt_id: String,
 ) -> StdResult<crate::worktree::DiffStat, String> {
-    state
-        .core()?
-        .attempt_stats(&attempt_id)
+    let core = state.core()?;
+    blocking(move || {
+        core.attempt_stats(&attempt_id)
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -644,43 +727,49 @@ fn attempt_events(
 
 /// The repository's run scripts, for the drawer's buttons.
 #[tauri::command]
-fn list_run_scripts(
+async fn list_run_scripts(
     state: State<'_, AppState>,
     attempt_id: String,
 ) -> StdResult<Vec<String>, String> {
-    state
-        .core()?
-        .list_run_scripts(&attempt_id)
+    let core = state.core()?;
+    blocking(move || {
+        core.list_run_scripts(&attempt_id)
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 /// A shell of your own in the attempt's worktree — reused while it lives.
 #[tauri::command]
-fn open_shell(
+async fn open_shell(
     state: State<'_, AppState>,
     attempt_id: String,
     cols: u16,
     rows: u16,
 ) -> StdResult<String, String> {
-    state
-        .core()?
-        .open_shell(&attempt_id, cols, rows)
+    let core = state.core()?;
+    blocking(move || {
+        core.open_shell(&attempt_id, cols, rows)
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 /// Start a run script in the attempt's worktree, in a terminal of its own.
 #[tauri::command]
-fn run_script(
+async fn run_script(
     state: State<'_, AppState>,
     attempt_id: String,
     name: String,
     cols: u16,
     rows: u16,
 ) -> StdResult<String, String> {
-    state
-        .core()?
-        .run_script(&attempt_id, &name, cols, rows)
+    let core = state.core()?;
+    blocking(move || {
+        core.run_script(&attempt_id, &name, cols, rows)
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 /* --------------------------- dev preview --------------------------- */
@@ -689,9 +778,15 @@ fn run_script(
 /// difference between "the dev server is up" and a blank iframe that
 /// could mean anything. Blank and broken must not look alike.
 #[tauri::command]
-fn probe_port(port: u16) -> bool {
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).is_ok()
+async fn probe_port(port: u16) -> StdResult<bool, String> {
+    // 400ms of connect timeout is 400ms of frozen window when it lands on the
+    // main thread — and a dead port is exactly the case that spends all of it.
+    blocking(move || {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let timeout = std::time::Duration::from_millis(400);
+        Ok(std::net::TcpStream::connect_timeout(&addr, timeout).is_ok())
+    })
+    .await
 }
 
 /* ----------------------------- worlds ------------------------------ */
@@ -699,16 +794,18 @@ fn probe_port(port: u16) -> bool {
 /// The worlds a card can live in — enumerated from `wsl -l` and
 /// `~/.ssh/config`, never invented, never probed remotely.
 #[tauri::command]
-fn list_worlds(state: State<'_, AppState>) -> StdResult<core::Worlds, String> {
-    Ok(state.core()?.list_worlds())
+async fn list_worlds(state: State<'_, AppState>) -> StdResult<core::Worlds, String> {
+    let core = state.core()?;
+    blocking(move || Ok(core.list_worlds())).await
 }
 
 /// Reach one world and report its claude, or the whole reason it could
 /// not be reached. Deliberately lazy: called on a person's pick, never
 /// at startup.
 #[tauri::command]
-fn probe_world(state: State<'_, AppState>, world: String) -> StdResult<core::WorldProbe, String> {
-    Ok(state.core()?.probe_world(&world))
+async fn probe_world(state: State<'_, AppState>, world: String) -> StdResult<core::WorldProbe, String> {
+    let core = state.core()?;
+    blocking(move || Ok(core.probe_world(&world))).await
 }
 
 /// One directory inside a world, for the folder picker.
@@ -716,15 +813,17 @@ fn probe_world(state: State<'_, AppState>, world: String) -> StdResult<core::Wor
 /// `path` of `null` starts at that world's own home. See `Core::list_dir` for
 /// why this exists rather than the platform's folder dialog.
 #[tauri::command]
-fn list_dir(
+async fn list_dir(
     state: State<'_, AppState>,
     world: String,
     path: Option<String>,
 ) -> StdResult<core::DirListing, String> {
-    state
-        .core()?
-        .list_dir(&world, path.as_deref())
+    let core = state.core()?;
+    blocking(move || {
+        core.list_dir(&world, path.as_deref())
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 /* ------------------------- editable diff --------------------------- */
@@ -732,32 +831,36 @@ fn list_dir(
 /// Both sides of one file in an attempt's diff, as full text: the base
 /// commit's copy and the worktree's. What the in-place editor edits.
 #[tauri::command]
-fn attempt_file(
+async fn attempt_file(
     state: State<'_, AppState>,
     attempt_id: String,
     path: String,
 ) -> StdResult<core::AttemptFile, String> {
-    state
-        .core()?
-        .attempt_file(&attempt_id, &path)
+    let core = state.core()?;
+    blocking(move || {
+        core.attempt_file(&attempt_id, &path)
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 /// Write one file in the attempt's worktree — a human's own edit. Refused
 /// mid-turn in the core, not just hidden in the UI; refused too when the
 /// disk no longer matches `expected`, the text the editor loaded.
 #[tauri::command]
-fn write_attempt_file(
+async fn write_attempt_file(
     state: State<'_, AppState>,
     attempt_id: String,
     path: String,
     contents: String,
     expected: Option<String>,
 ) -> StdResult<(), String> {
-    state
-        .core()?
-        .write_attempt_file(&attempt_id, &path, &contents, expected.as_deref())
+    let core = state.core()?;
+    blocking(move || {
+        core.write_attempt_file(&attempt_id, &path, &contents, expected.as_deref())
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 /* ---------------------------- parked ------------------------------- */
@@ -766,26 +869,30 @@ fn write_attempt_file(
 /// give back the worktree and the concurrency slot. Returns the branch
 /// name — the UI puts it on the clipboard.
 #[tauri::command]
-fn park_attempt(state: State<'_, AppState>, attempt_id: String) -> StdResult<String, String> {
-    state
-        .core()?
-        .park_attempt(&attempt_id)
+async fn park_attempt(state: State<'_, AppState>, attempt_id: String) -> StdResult<String, String> {
+    let core = state.core()?;
+    blocking(move || {
+        core.park_attempt(&attempt_id)
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 /// Resume a parked attempt: worktree back at its old path on its branch,
 /// shelf checkpoint restored, terminal reopened with the old conversation.
 #[tauri::command]
-fn resume_attempt(
+async fn resume_attempt(
     state: State<'_, AppState>,
     attempt_id: String,
     cols: u16,
     rows: u16,
 ) -> StdResult<core::Resumed, String> {
-    state
-        .core()?
-        .resume_attempt(&attempt_id, cols, rows)
+    let core = state.core()?;
+    blocking(move || {
+        core.resume_attempt(&attempt_id, cols, rows)
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 /* -------------------------- checkpoints ---------------------------- */
@@ -983,39 +1090,45 @@ fn set_checkpoints_enabled(state: State<'_, AppState>, on: bool) -> StdResult<()
 /// The manual snapshot button. `None` means the worktree matches the last
 /// checkpoint already — nothing new to keep.
 #[tauri::command]
-fn checkpoint_now(
+async fn checkpoint_now(
     state: State<'_, AppState>,
     attempt_id: String,
 ) -> StdResult<Option<crate::worktree::Checkpoint>, String> {
-    state
-        .core()?
-        .checkpoint_now(&attempt_id)
+    let core = state.core()?;
+    blocking(move || {
+        core.checkpoint_now(&attempt_id)
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 #[tauri::command]
-fn list_checkpoints(
+async fn list_checkpoints(
     state: State<'_, AppState>,
     attempt_id: String,
 ) -> StdResult<Vec<crate::worktree::Checkpoint>, String> {
-    state
-        .core()?
-        .list_checkpoints(&attempt_id)
+    let core = state.core()?;
+    blocking(move || {
+        core.list_checkpoints(&attempt_id)
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 /// Put the worktree back to checkpoint `n` (`0` = the attempt's base).
 /// Code only; refused while a turn is in flight.
 #[tauri::command]
-fn restore_checkpoint(
+async fn restore_checkpoint(
     state: State<'_, AppState>,
     attempt_id: String,
     n: u64,
 ) -> StdResult<core::Restored, String> {
-    state
-        .core()?
-        .restore_checkpoint(&attempt_id, n)
+    let core = state.core()?;
+    blocking(move || {
+        core.restore_checkpoint(&attempt_id, n)
         .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 /* -------------------------- notifications -------------------------- */
@@ -1195,4 +1308,94 @@ fn main() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    /// Stated as a test so nobody quietly puts a doorway back on the window's
+    /// own thread.
+    ///
+    /// A `#[tauri::command]` written as a plain `fn` runs its whole body on
+    /// the main thread — see `blocking` for the chain that makes that true.
+    /// Every command that can reach another world therefore has to be `async`
+    /// and hand its work to `blocking`. The exceptions are listed here with
+    /// the reason each one earns, because "this one is fine" should cost a
+    /// line of prose rather than a shrug.
+    ///
+    /// Checked in both directions: a new synchronous command that is not
+    /// named here fails, and a name here that has since become `async` fails
+    /// too — so the list cannot rot into a wishlist.
+    #[test]
+    fn no_command_that_can_reach_a_world_runs_on_the_main_thread() {
+        // (command, why it may stay synchronous)
+        const ALLOWED: &[(&str, &str)] = &[
+            // The terminal's hot path. See `term_write`: microseconds, and
+            // ordering matters more than the microseconds.
+            ("term_write", "ordering — a keystroke must not overtake its predecessor"),
+            ("term_resize", "ordering — a resize must not overtake the keys before it"),
+            ("term_snapshot", "base64 of an in-memory buffer this process owns"),
+            // Main-thread affine by nature: it rewrites the tray's menu items.
+            ("set_locale", "touches the tray, which belongs to the main thread"),
+            // Everything below reads or writes only this process's memory and
+            // its own SQLite file. No process is spawned, no host is reached.
+            ("boot_status", "reads the environment probed once at startup"),
+            ("update_status", "settings and an in-memory count"),
+            ("list_sessions", "in-memory"),
+            ("list_tasks", "in-memory and SQLite"),
+            ("list_tabs", "SQLite"),
+            ("create_tab", "SQLite"),
+            ("rename_tab", "SQLite"),
+            ("close_tab", "SQLite"),
+            ("update_tab", "SQLite"),
+            ("set_completed", "SQLite"),
+            ("rename_session", "SQLite"),
+            ("attempt_events", "SQLite"),
+            ("cancel_followup", "in-memory"),
+            ("list_launchers", "SQLite"),
+            ("list_profiles", "SQLite"),
+            ("save_profiles", "SQLite"),
+            ("notify_prefs", "in-memory"),
+            ("set_notify_prefs", "SQLite"),
+            ("test_notification", "hands one line to the OS notifier"),
+            ("checkpoints_enabled", "SQLite"),
+            ("set_checkpoints_enabled", "SQLite"),
+            ("set_update_enabled", "SQLite"),
+        ];
+
+        let src = include_str!("main.rs");
+        let (mut sync, mut not_sync) = (Vec::new(), Vec::new());
+        for block in src.split("#[tauri::command]").skip(1) {
+            let Some(line) = block
+                .lines()
+                .find(|l| l.starts_with("fn ") || l.starts_with("async fn "))
+            else {
+                continue;
+            };
+            let (list, rest) = match line.strip_prefix("async fn ") {
+                Some(rest) => (&mut not_sync, rest),
+                None => (&mut sync, &line["fn ".len()..]),
+            };
+            list.push(rest.split('(').next().unwrap_or_default());
+        }
+        assert!(
+            sync.len() + not_sync.len() > 40,
+            "the scan found nothing to check — has the command shape changed?"
+        );
+
+        for name in &sync {
+            assert!(
+                ALLOWED.iter().any(|(n, _)| n == name),
+                "`{name}` is a synchronous command, so its whole body runs on the \
+                 main thread. Make it `async` and put the work through `blocking`, \
+                 or add it to ALLOWED with the reason it is safe."
+            );
+        }
+        for (name, _) in ALLOWED {
+            assert!(
+                sync.contains(name),
+                "ALLOWED still names `{name}`, which is no longer a synchronous \
+                 command. Drop the entry rather than leaving the list to rot."
+            );
+        }
+    }
 }

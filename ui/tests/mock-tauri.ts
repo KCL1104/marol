@@ -18,6 +18,10 @@ export interface MockSession {
   last_active_at: number;
   live: boolean;
   reports_status: boolean;
+  hooks_wired: boolean;
+  /** Who has a message waiting for this session's turn to end. Absent is the
+   *  ordinary case; a person's own note leaves it empty. */
+  pending_from?: string[];
   /** The $MAROL_PORT a run script was handed, when reachable. */
   preview_port: number | null;
   /** The conversation's token account — tests seed it, the core computes it. */
@@ -136,6 +140,9 @@ declare global {
       sessionSeq: number;
       /** What probe_port answers — false plays an unreachable server. */
       portListening: boolean;
+      /** Measured CLIs whose version is too old to be wired for status, so a
+       *  session of theirs launches with no hooks at all. */
+      unwiredAgents: string[];
       /** What the world switch enumerates. */
       worlds: { wsl: string[]; ssh: string[] };
       /** Seeded by tests: per-world probe answers. */
@@ -303,6 +310,7 @@ export function installMock(): void {
     resumeRestoreError: null as string | null,
     sessionSeq: 0,
     portListening: true,
+    unwiredAgents: [] as string[],
     /** What the world switch enumerates — a Windows machine's shape. */
     worlds: { wsl: ['Ubuntu'], ssh: ['devbox'] } as { wsl: string[]; ssh: string[] },
     /** Seeded by tests: what probing a world answers. */
@@ -467,6 +475,12 @@ export function installMock(): void {
       last_active_at: now(),
       live: true,
       reports_status: false,
+      // Mirrors the real gate at core.rs launch(): a session is wired only
+      // when this desk knows the CLI's conventions and the version in that
+      // world is new enough. `unwiredAgents` is how a test plays the second
+      // half — a codex too old for its own hooks engine.
+      hooks_wired:
+        ['claude', 'codex'].includes(agent) && !mock.unwiredAgents.includes(agent),
       preview_port: null,
       activity: null,
       activity_since: 0,

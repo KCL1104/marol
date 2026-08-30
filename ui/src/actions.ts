@@ -16,6 +16,7 @@ export type ActionId =
   | 'last-session'
   | 'new-card'
   | 'new-session'
+  | 'toggle-sidebar'
   | 'toggle-inspector'
   | 'view-terminal'
   | 'view-board'
@@ -62,6 +63,10 @@ export const ACTIONS: readonly ActionDef[] = [
   // 已經是叫出面板的寫法),C 是複製,E/F/I 各有原主。
   { id: 'new-card', title: 'board.newCard', keys: '⌘/Ctrl + Shift + N' },
   { id: 'new-session', title: 'sidebar.newSession', keys: null },
+  // B 是每個有側欄的編輯器都用的那顆,所以它不必被學。Ctrl+B 是
+  // readline 的 backward-char,終端機內因此要加 Shift —— 與 E/L/F/I
+  // 同一條規則,不是這顆的例外。
+  { id: 'toggle-sidebar', title: 'keys.sidebar', keys: '⌘/Ctrl + B' },
   { id: 'toggle-inspector', title: 'keys.inspector', keys: '⌘/Ctrl + I', when: (c) => c.canInspect },
   { id: 'view-terminal', title: 'view.terminal', keys: '⌘/Ctrl + 1' },
   { id: 'view-board', title: 'view.board', keys: '⌘/Ctrl + 2' },
@@ -85,6 +90,29 @@ export const KEY_DOCS: readonly { combo: string; what: MessageKey }[] = [
   { combo: 'Ctrl + PgDn · PgUp', what: 'keys.cycleTabs' },
   { combo: 'J · K', what: 'inspector.diffKeys' },
   { combo: 'Esc', what: 'keys.escape' },
+];
+
+/**
+ * Keys that belong to the agent, not to this desk.
+ *
+ * Listed apart from `KEY_DOCS` on purpose: everything in that table is a
+ * chord Marol binds and could change, and everything here is one the CLI
+ * owns and Marol merely knows about. Folding them together would tell a
+ * reader this app is responsible for a key it cannot alter.
+ *
+ * They earn a place at all because of what the wheel can and cannot do. On
+ * the alternate buffer — which is every agent pane in a world that has tmux
+ * — a wheel notch is cursor keys sent to the program, so it walks whatever
+ * that program calls scrolling. Codex's own transcript view is the thing
+ * that actually holds the conversation, and nothing on screen said so.
+ *
+ * Codex only, because Codex is the CLI whose table was measured
+ * (`keymap.rs`, the pager keymap). An entry here for a CLI nobody checked
+ * would be a guess wearing a shortcut's clothes.
+ */
+export const AGENT_KEYS: readonly { agent: string; combo: string; what: MessageKey }[] = [
+  { agent: 'codex', combo: 'Ctrl + T', what: 'keys.codexTranscript' },
+  { agent: 'codex', combo: 'PgUp · PgDn · Ctrl+U · Ctrl+D · j · k', what: 'keys.codexPager' },
 ];
 
 /**

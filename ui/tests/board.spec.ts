@@ -176,6 +176,29 @@ test.describe('board', () => {
     await expect(page.getByTestId('nosignal-k1')).toHaveCount(0);
   });
 
+  /**
+   * The gap this closes: being a CLI Marol *knows* is not the same as being
+   * one it *wired*. A codex older than its own hooks engine runs a session
+   * perfectly and never says a word — and the card used to withhold the
+   * disclaimer precisely because codex is measured, so a card that would
+   * never report was indistinguishable from one working quietly. On the one
+   * surface whose job is to be believed at a glance, that is the worst
+   * possible failure.
+   */
+  test('a measured CLI that was never wired for status says so too', async ({ page }) => {
+    await boot(page);
+    await page.evaluate(() => {
+      window.__mock.unwiredAgents = ['codex'];
+    });
+    await newCard(page, '修好登入');
+    await start(page, 'k1', 'codex');
+    await page.getByTestId('view-board').click();
+
+    await expect(page.getByTestId('nosignal-k1')).toHaveText('沒有狀態回報');
+    // And it names the reason, which is a version rather than the CLI.
+    await expect(page.getByTestId('nosignal-k1')).toHaveAttribute('title', /codex/);
+  });
+
   // One test per CLI rather than a loop inside one: the board keeps its
   // state across a reload, so a second card in the same page is `k2` and
   // the assertions would quietly move off the card they were written for.

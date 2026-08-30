@@ -166,6 +166,16 @@ impl Host {
         (p, a)
     }
 
+    /// `wrap`, for a long-lived shell on pipes rather than a terminal.
+    ///
+    /// No `-t`, because there is no terminal on this side to give one and the
+    /// thing on the far end is reading a script; the environment still
+    /// crosses, because it is what the commands inside will resolve against.
+    pub fn wrap_channel(&self, program: &str, envs: &[(String, String)]) -> (String, Vec<String>) {
+        let (p, a, _) = self.wrap_inner(program, &[], None, envs, false);
+        (p, a)
+    }
+
     fn wrap_inner<'a>(
         &self,
         program: &str,
@@ -282,6 +292,30 @@ impl Host {
                 })
             }
         }
+    }
+}
+
+/// A channel's answer in the shape every caller here already reads.
+///
+/// `ExitStatus` cannot be built from a number in stable Rust, so the exit
+/// code rides through the platform's own encoding — the one place this file
+/// has to know that a status is a wait(2) word on unix and a plain code on
+/// Windows.
+fn as_output(a: crate::channel::Answer) -> std::process::Output {
+    #[cfg(unix)]
+    let status = {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(a.status << 8)
+    };
+    #[cfg(windows)]
+    let status = {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(a.status as u32)
+    };
+    std::process::Output {
+        status,
+        stdout: a.stdout,
+        stderr: a.stderr,
     }
 }
 
@@ -443,6 +477,41 @@ fn ssh_base_args(tty: bool) -> Vec<String> {
     args
 }
 
+/// The exit status these scripts use for "the file is not there".
+///
+/// A number of our own because the shells' own are taken: `cat` and `tail`
+/// both exit 1 for a missing file *and* for one they were not allowed to
+/// read, and this app has always insisted those are different answers — one
+/// is `Ok(None)`, the other is an error worth showing.
+const ABSENT: i32 = 3;
+
+/// `cat` the file, or say plainly that it is not there.
+const READ_IF_PRESENT: &str = r#"if [ -e "$1" ]; then cat -- "$1"; else exit 3; fi"#;
+
+/// The same, from a byte offset — the append-only transcript read.
+const TAIL_IF_PRESENT: &str = r#"if [ -e "$1" ]; then tail -c "$2" -- "$1"; else exit 3; fi"#;
+
+/// `1` or `0` per path, in the order given.
+const EXIST_ALL: &str = r#"for p in "$@"; do
+  if [ -e "$p" ]; then echo 1; else echo 0; fi
+done"#;
+
+/// The skill names under each root, one U+001E-separated section per root.
+///
+/// `$root/*/SKILL.md` rather than a listing plus a test apiece: the glob is
+/// the filter, and an unmatched glob stays literal in `sh`, which is why the
+/// existence of the file is checked before the name is printed.
+const SKILLS_IN: &str = r#"first=1
+for root in "$@"; do
+  [ $first -eq 1 ] || printf '\036'
+  first=0
+  for d in "$root"/*/; do
+    [ -f "$d/SKILL.md" ] || continue
+    b=${d%/}
+    printf '%s\n' "${b##*/}"
+  done
+done"#;
+
 /// A host together with both environments commands need: the app machine's
 /// (`local`, which finds `wsl.exe`) and the host's own (`env`, whose PATH
 /// finds what runs inside). Built by the core from its per-host cache and
@@ -452,6 +521,10 @@ pub struct HostRef<'a> {
     pub host: &'a Host,
     pub local: &'a ShellEnv,
     pub env: &'a ShellEnv,
+    /// This world's held shells, when it has any. `None` is a world that
+    /// keeps none — every test that builds a `HostRef` by hand, and the local
+    /// host, which has no doorway to amortise.
+    pub channels: Option<&'a crate::channel::Channels>,
 }
 
 impl HostRef<'_> {
@@ -492,22 +565,35 @@ impl HostRef<'_> {
                 }
                 Ok(cmd.output()?)
             }
-            Host::Wsl { .. } => {
-                let carried = carried_with(self.env, extra);
-                let (_, wrapped, _) = self.host.wrap(program, &owned, cwd, &carried);
-                Ok(std::process::Command::new(wsl_exe(self.local))
-                    .args(wrapped)
-                    .output()?)
-            }
-            Host::Ssh { host } => {
-                let carried = carried_with(self.env, extra);
-                let mut a = ssh_base_args(false);
-                a.push("--".to_string());
-                a.push(host.clone());
-                a.push(remote_command(program, &owned, cwd, &carried));
-                Ok(std::process::Command::new(ssh_exe(self.local))
-                    .args(a)
-                    .output()?)
+            // Behind a doorway, a held shell answers without a process if
+            // one is free. Declining is normal and costs nothing: the spawn
+            // below is what this app did before there were channels at all.
+            _ => {
+                if let Some(answer) = self.channels.and_then(|c| {
+                    c.run(self.host, self.local, self.env, program, args, cwd, extra)
+                }) {
+                    return Ok(as_output(answer));
+                }
+                match self.host {
+                    Host::Local => unreachable!("handled above"),
+                    Host::Wsl { .. } => {
+                        let carried = carried_with(self.env, extra);
+                        let (_, wrapped, _) = self.host.wrap(program, &owned, cwd, &carried);
+                        Ok(std::process::Command::new(wsl_exe(self.local))
+                            .args(wrapped)
+                            .output()?)
+                    }
+                    Host::Ssh { host } => {
+                        let carried = carried_with(self.env, extra);
+                        let mut a = ssh_base_args(false);
+                        a.push("--".to_string());
+                        a.push(host.clone());
+                        a.push(remote_command(program, &owned, cwd, &carried));
+                        Ok(std::process::Command::new(ssh_exe(self.local))
+                            .args(a)
+                            .output()?)
+                    }
+                }
             }
         }
     }
@@ -581,6 +667,95 @@ impl HostRef<'_> {
         }
     }
 
+    /// Which of these exist, in the order asked.
+    ///
+    /// One crossing for the whole list. Locally it stays a syscall apiece,
+    /// because locally that is what one crossing costs anyway — and because
+    /// `sh` is not on a Windows login-shell PATH, which is the same reason
+    /// `Core::list_dir` keeps a native branch.
+    ///
+    /// A failure answers "none of them", which is what every caller means by
+    /// a path it cannot reach: `agent_docs` lists a rules file that is not
+    /// there just as deliberately as one that is, and "absent" is the honest
+    /// reading of a world that would not answer.
+    pub fn exist_all(&self, paths: &[&str]) -> Vec<bool> {
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        match self.host {
+            Host::Local => paths
+                .iter()
+                .map(|p| std::path::Path::new(p).exists())
+                .collect(),
+            _ => {
+                let mut argv: Vec<&str> = vec!["-c", EXIST_ALL, "_"];
+                argv.extend(paths.iter().copied());
+                let answered = self
+                    .run_ok("sh", &argv, None)
+                    .map(|out| out.lines().map(|l| l == "1").collect::<Vec<bool>>())
+                    .unwrap_or_default();
+                // A short answer is a broken one; padding with `false` beats
+                // zipping a mismatched list onto the paths it describes.
+                paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| answered.get(i).copied().unwrap_or(false))
+                    .collect()
+            }
+        }
+    }
+
+    /// The skill directories under each root — the ones that actually hold a
+    /// `SKILL.md`, since a directory without one is somebody's notes.
+    ///
+    /// One crossing for every root together, where this used to be a listing
+    /// per root plus a `test -e` per entry.
+    pub fn skills_in(&self, roots: &[&str]) -> Vec<Vec<String>> {
+        if roots.is_empty() {
+            return Vec::new();
+        }
+        match self.host {
+            Host::Local => roots
+                .iter()
+                .map(|root| {
+                    let mut names: Vec<String> = std::fs::read_dir(root)
+                        .map(|it| {
+                            it.flatten()
+                                .filter(|e| e.path().join("SKILL.md").exists())
+                                .map(|e| e.file_name().to_string_lossy().into_owned())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    names.sort();
+                    names
+                })
+                .collect(),
+            _ => {
+                let mut argv: Vec<&str> = vec!["-c", SKILLS_IN, "_"];
+                argv.extend(roots.iter().copied());
+                let text = self.run_ok("sh", &argv, None).unwrap_or_default();
+                // One section per root, in the order asked, so a root that
+                // holds nothing is an empty section rather than a missing one.
+                let mut sections = text.split('\u{1e}');
+                roots
+                    .iter()
+                    .map(|_| {
+                        sections
+                            .next()
+                            .map(|s| {
+                                s.lines()
+                                    .map(str::trim)
+                                    .filter(|l| !l.is_empty())
+                                    .map(str::to_string)
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            }
+        }
+    }
+
     pub fn mkdir_p(&self, path: &str) -> Result<()> {
         match self.host {
             Host::Local => Ok(std::fs::create_dir_all(path)?),
@@ -601,19 +776,25 @@ impl HostRef<'_> {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(e.into()),
             },
+            // One crossing, not two. Asking `exists` and then `cat` is two
+            // processes through the doorway to answer one question, and
+            // through `wsl.exe` a process is the expensive part — locally
+            // both are a syscall, which is why the cost never showed here.
+            //
+            // The M6 distinction survives the fold: `cat` alone cannot tell
+            // an absent file from an unreadable one, so absence gets a status
+            // of its own rather than being inferred from a failure.
             _ => {
-                if !self.exists(path) {
-                    return Ok(None);
-                }
-                // Raw stdout, not `run_ok`'s trim: file text is content.
-                let out = self.run("cat", &[path], None)?;
-                if !out.status.success() {
-                    return Err(anyhow!(
+                let out = self.run("sh", &["-c", READ_IF_PRESENT, "_", path], None)?;
+                match out.status.code() {
+                    Some(ABSENT) => Ok(None),
+                    // Raw stdout, not `run_ok`'s trim: file text is content.
+                    Some(0) => Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned())),
+                    _ => Err(anyhow!(
                         "reading {path}: {}",
                         String::from_utf8_lossy(&out.stderr).trim()
-                    ));
+                    )),
                 }
-                Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()))
             }
         }
     }
@@ -637,20 +818,21 @@ impl HostRef<'_> {
                 f.read_to_end(&mut buf)?;
                 Ok(Some(buf))
             }
+            // Folded the same way `read_to_string` is, and it matters more
+            // here: this one runs once per turn, per session, to keep the
+            // token account.
             _ => {
-                if !self.exists(path) {
-                    return Ok(None);
-                }
                 // `tail -c +N` is 1-based: +1 is the whole file.
                 let from = format!("+{}", offset.saturating_add(1));
-                let out = self.run("tail", &["-c", &from, "--", path], None)?;
-                if !out.status.success() {
-                    return Err(anyhow!(
+                let out = self.run("sh", &["-c", TAIL_IF_PRESENT, "_", path, &from], None)?;
+                match out.status.code() {
+                    Some(ABSENT) => Ok(None),
+                    Some(0) => Ok(Some(out.stdout)),
+                    _ => Err(anyhow!(
                         "reading {path} from byte {offset}: {}",
                         String::from_utf8_lossy(&out.stderr).trim()
-                    ));
+                    )),
                 }
-                Ok(Some(out.stdout))
             }
         }
     }
@@ -793,6 +975,12 @@ fn carry_env(env: &ShellEnv) -> Vec<(String, String)> {
         .collect()
 }
 
+/// What crosses into a held shell: the same pair every wrapped command has
+/// always carried, set once at the far end instead of on every command line.
+pub fn carry_env_pub(env: &ShellEnv) -> Vec<(String, String)> {
+    carry_env(env)
+}
+
 /// `carry_env` plus one call's extras, extras last: POSIX `env` applies
 /// assignments left to right, so on a collision the extra wins — the same
 /// precedence the local path gets from calling `.envs` twice.
@@ -850,7 +1038,7 @@ mod tests {
         // 問版本要穿過門去問 —— distro 裡的檔案在門的另一邊,本機的
         // which() 摸不到(第一版測試的錯);core 的世界探測走的就是這條:
         // HostRef::run_ok 把指令包成 wsl.exe -d <distro> -e env … claude。
-        let hr = HostRef { host: &host, local: &local, env: &env };
+        let hr = HostRef { host: &host, local: &local, env: &env, channels: None };
         for agent in wanted {
             let out = hr
                 .run_ok(agent, &["--version"], None)
@@ -1097,6 +1285,7 @@ prompt".into()],
             host: &local,
             local: &env,
             env: &env,
+            channels: None,
         };
         let extra = [("MAROL_PROBE".to_string(), "set".to_string())];
         let with = hr

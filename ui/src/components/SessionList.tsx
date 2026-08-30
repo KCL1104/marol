@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { memo, useEffect, useState } from 'react';
 import { needsYou, type SessionMeta } from '../types';
 import { elapsed, SECTION_KEY, STATUS_KEY, useSections, type Section } from '../sections';
 import { useT } from '../i18n';
@@ -20,6 +20,10 @@ interface Props {
   onComplete: (id: string, completed: boolean) => void;
   onRename: (id: string, title: string) => void;
   onShowSettings: () => void;
+  /** Folded down to the rail. The state lives in the App because three
+      things set it — this header's button, ⌘/Ctrl+B, and the palette. */
+  folded: boolean;
+  onToggleFold: () => void;
 }
 
 /** Blocked rows first: with many agents, "who is waiting on me" is the
@@ -37,6 +41,8 @@ export function SessionList({
   onComplete,
   onRename,
   onShowSettings,
+  folded,
+  onToggleFold,
 }: Props) {
   const t = useT();
   const display = useSections(sessions, activeId);
@@ -51,25 +57,109 @@ export function SessionList({
     done: true,
   });
 
-  // One timer drives every elapsed counter, rather than one per row.
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, []);
-
   const bySection = new Map<Section, SessionMeta[]>(ORDER.map((s) => [s, []]));
   for (const s of sessions) {
     bySection.get(display[s.id] ?? 'working')?.push(s);
   }
 
+  /**
+   * Whether anything on screen is actually counting.
+   *
+   * The elapsed readout only exists on a row that is showing an activity
+   * line, in an open section, in an unfolded sidebar — so the timer only
+   * exists then too. It used to run unconditionally, which meant a desk of
+   * idle agents re-rendered every row once a second to redraw text that had
+   * not changed, for as long as the app was open. On a slow host that is a
+   * second job competing with the terminal for the same frame.
+   */
+  const ticking =
+    !folded &&
+    ORDER.some(
+      (section) =>
+        !collapsed[section] &&
+        (bySection.get(section) ?? []).some((s) => s.activity && s.activity_since),
+    );
+
+  // One timer drives every elapsed counter, rather than one per row.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!ticking) return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [ticking]);
+
+  /** The blocked queue, advanced one step — the banner, the rail and ⌘E all
+   *  cycle rather than jump, so answering three agents is one repeated key. */
+  const nextWaiting = () => {
+    const i = waiting.findIndex((s) => s.id === activeId);
+    onSelect(waiting[(i + 1) % waiting.length].id);
+  };
+
+  /**
+   * Folded: a rail, not a hidden sidebar.
+   *
+   * Two things survive the fold, and only two. The way back, because a state
+   * you can only leave through a keyboard shortcut is a state people get
+   * stuck in. And the waiting count, because "how many agents need me" is the
+   * one number this app exists to keep on screen — folding the list away must
+   * not fold that away with it.
+   *
+   * Everything else unmounts. That is the point: no rows, no sections, no
+   * timer.
+   */
+  if (folded) {
+    return (
+      <aside className="sidebar folded" data-testid="sidebar">
+        <button
+          className="rail-btn"
+          data-testid="sidebar-unfold"
+          aria-label={t('sidebar.unfold')}
+          aria-expanded={false}
+          title={t('sidebar.unfold')}
+          onClick={onToggleFold}
+        >
+          »
+        </button>
+        {waiting.length > 0 && (
+          <button
+            className="rail-waiting"
+            data-testid="rail-waiting"
+            aria-label={t('sidebar.waitingCount', { count: waiting.length })}
+            title={t('sidebar.waitingCount', { count: waiting.length })}
+            onClick={nextWaiting}
+          >
+            <Icon name="warn" />
+            <span className="rail-count">{waiting.length}</span>
+          </button>
+        )}
+      </aside>
+    );
+  }
+
   return (
-    <aside className="sidebar">
+    <aside className="sidebar" data-testid="sidebar">
       <div className="sidebar-head">
         <span>{t('sidebar.title')}</span>
-        <button className="icon" onClick={onNew} title={t('sidebar.newSession')}>
-          +
-        </button>
+        {/* Two icon buttons share the right end, so they ride in one box —
+            .sidebar-head is space-between and would otherwise push the title
+            into the middle. */}
+        <span className="head-actions">
+          <button className="icon" onClick={onNew} title={t('sidebar.newSession')}>
+            +
+          </button>
+          <button
+            // Not `.icon` — see the CSS. The suite reads `.sidebar-head
+            // button.icon` as "the + button" in sixteen files.
+            className="head-fold"
+            data-testid="sidebar-fold"
+            aria-label={t('sidebar.fold')}
+            aria-expanded
+            title={t('sidebar.fold')}
+            onClick={onToggleFold}
+          >
+            «
+          </button>
+        </span>
       </div>
 
       {waiting.length > 0 && (
@@ -78,10 +168,7 @@ export function SessionList({
           // Cycles like ⌘E: with three blocked agents each click lands on
           // the next one, instead of revisiting the first forever while the
           // keyboard path moves on. Same affordance, same behaviour.
-          onClick={() => {
-            const i = waiting.findIndex((s) => s.id === activeId);
-            onSelect(waiting[(i + 1) % waiting.length].id);
-          }}
+          onClick={nextWaiting}
         >
           <Icon name="warn" />
           {t('sidebar.waitingCount', { count: waiting.length })}
@@ -114,7 +201,11 @@ export function SessionList({
                     session={s}
                     active={s.id === activeId}
                     unseen={unseen.has(s.id)}
-                    now={now}
+                    // The string, not the clock. A row is memoised on its
+                    // props, and every row used to take `now` — so one tick
+                    // re-rendered all of them. Most rows show no counter at
+                    // all, and their '' never changes.
+                    since={elapsed(s.activity_since, now)}
                     onSelect={onSelect}
                     onClose={onClose}
                     onArchive={onArchive}
@@ -142,11 +233,20 @@ export function SessionList({
   );
 }
 
-function Row({
+/**
+ * One row.
+ *
+ * Memoised, and that is load-bearing rather than tidy: the elapsed timer
+ * re-renders this list once a second while any agent is working, and without
+ * this every row in it — most of them showing no clock at all — would be
+ * rebuilt each tick. The handlers come from the App and keep their identity
+ * across a tick, because a tick is state local to the list above.
+ */
+const Row = memo(function Row({
   session: s,
   active,
   unseen,
-  now,
+  since,
   onSelect,
   onClose,
   onArchive,
@@ -156,7 +256,9 @@ function Row({
   session: SessionMeta;
   active: boolean;
   unseen: boolean;
-  now: number;
+  /** Already rendered by the parent — see the call site. '' for a row with
+      nothing to count, which is what lets that row skip the tick entirely. */
+  since: string;
   onSelect: (id: string) => void;
   onClose: (id: string) => void;
   onArchive: (id: string) => void;
@@ -165,7 +267,6 @@ function Row({
 }) {
   const t = useT();
   const activity = s.activity;
-  const since = elapsed(s.activity_since, now);
   const [editing, setEditing] = useState(false);
 
   return (
@@ -293,7 +394,7 @@ function Row({
       </div>
     </div>
   );
-}
+});
 
 
 /**

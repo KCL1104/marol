@@ -8,7 +8,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -118,6 +118,20 @@ pub struct SessionMeta {
     /// True once the status plugin has reported at least once, so the UI can
     /// distinguish "idle" from "this CLI does not report status".
     pub reports_status: bool,
+    /// Whether this session's CLI was actually wired for status when it
+    /// launched.
+    ///
+    /// Not the same question as `reports_status`, and the difference is the
+    /// whole point: that one says "it has spoken", this one says "it was
+    /// given a mouth". A session with `hooks_wired` false will never report,
+    /// ever, and the card can say so at once instead of waiting out a
+    /// silence that has no end.
+    ///
+    /// Per session rather than per CLI because the answer is per *world*: a
+    /// distro's own codex may be new enough while this machine's is not, and
+    /// `host_env` probes each world's CLIs separately. A global "does codex
+    /// report" would be a fact about the wrong computer.
+    pub hooks_wired: bool,
     /// What the agent is doing right now, from the last `PreToolUse` report.
     pub activity: Option<Activity>,
     /// When that activity started, for an elapsed counter.
@@ -142,6 +156,12 @@ pub struct SessionMeta {
     /// A message is queued to go in when this turn ends. Transient, like
     /// the PTY it waits on — never stored, false on every restore.
     pub has_followup: bool,
+    /// Who has a message waiting for this session's turn to end, distinct and
+    /// in arrival order. Empty when the only thing queued is the person's own
+    /// follow-up — which is the difference the drawer has to show, because
+    /// "you left a note here" and "two other agents are waiting on this one"
+    /// are not the same fact and were rendered as the same sentence.
+    pub pending_from: Vec<String>,
     /// The `$MAROL_PORT` a run script was handed, when the app can
     /// reach it (local and WSL; an SSH host's port lives on the remote).
     /// Transient like the followup flag: the server dies with the PTY, and
@@ -353,6 +373,7 @@ impl SessionMeta {
             last_active_at: s.last_active_at,
             live: false,
             reports_status: false,
+            hooks_wired: false,
             activity: None,
             activity_since: 0,
             completed: s.completed,
@@ -363,6 +384,7 @@ impl SessionMeta {
             // one live again is `reopen_session`, which is the agent path.
             agent_session: true,
             has_followup: false,
+            pending_from: Vec::new(),
             preview_port: None,
             usage: None,
             transcript_path: None,
@@ -827,6 +849,15 @@ struct Router {
     /// command once in a while, read on every hook.
     notify_prefs: Arc<Mutex<NotifyPrefs>>,
     sessions: Arc<Mutex<HashMap<String, SessionMeta>>>,
+    /// Each wired session's own token for the two channels it can *ask* on.
+    ///
+    /// Shared with the core rather than reached through the weak reference,
+    /// because it is read on every message and a `send` that raced the core's
+    /// teardown should refuse rather than upgrade a dead pointer.
+    ///
+    /// Never on `SessionMeta`: that struct is serialised to the webview on
+    /// every broadcast, and a token in it would be a token in the page.
+    send_tokens: Arc<Mutex<HashMap<String, String>>>,
     /// Set once the core exists, so an exiting terminal can let the queue know
     /// a slot just came free. Weak, because the core owns this router.
     core: OnceLock<std::sync::Weak<Core>>,
@@ -840,6 +871,23 @@ struct Router {
 }
 
 impl Router {
+    /// Whether this really is that session speaking.
+    ///
+    /// Constant-time is not the property that matters here — the token is a
+    /// v4 uuid handed only to one local process's environment, and anything
+    /// positioned to time this endpoint is already inside the machine. What
+    /// matters is that it is checked at all: `sid` alone is a uuid a sibling
+    /// session could read out of its own environment and reuse.
+    fn token_ok(&self, session_id: &str, token: &str) -> bool {
+        !token.is_empty()
+            && self
+                .send_tokens
+                .lock()
+                .unwrap()
+                .get(session_id)
+                .is_some_and(|t| t == token)
+    }
+
     fn broadcast(&self) {
         let mut list: Vec<SessionMeta> = self.sessions.lock().unwrap().values().cloned().collect();
         list.sort_by(|a, b| b.last_active_at.cmp(&a.last_active_at));
@@ -1085,6 +1133,96 @@ impl HookHandler for Router {
         }
     }
 
+    /// Who else is on this desk, for a session that wants to write to one.
+    ///
+    /// Live agent sessions only, and never the asker itself — a list holding
+    /// your own address invites a loop, and a shell or a run script is not
+    /// something to address. Plain text, one per line, because the sender is
+    /// a shell one-liner and `cut -f1` is the whole parser it should need.
+    fn on_peers(&self, session_id: &str, token: &str) -> Option<String> {
+        if !self.token_ok(session_id, token) {
+            return None;
+        }
+        let sessions = self.sessions.lock().unwrap();
+        let mut rows: Vec<String> = sessions
+            .values()
+            .filter(|s| s.id != session_id && s.live && s.agent_session)
+            .map(|s| format!("{}\t{}\t{}", s.id, s.title, status_name(s.status)))
+            .collect();
+        rows.sort();
+        Some(rows.join("\n") + if rows.is_empty() { "" } else { "\n" })
+    }
+
+    /// One session writing to another.
+    ///
+    /// Queued rather than typed straight in, always: the target may be
+    /// mid-turn, and a paste landing in the middle of one steers it instead
+    /// of answering it. A target that is *not* mid-turn has its queue flushed
+    /// at once, so a message to an idle agent arrives now rather than waiting
+    /// for a turn that may never come.
+    ///
+    /// Every refusal names itself, because the sender is an agent that can
+    /// act on the answer — which is the whole reason this returns a reason
+    /// rather than dropping the message.
+    fn on_send(&self, session_id: &str, token: &str, to: &str, text: &str) -> Result<(), String> {
+        if !self.token_ok(session_id, token) {
+            return Err("not this session's token".to_string());
+        }
+        if session_id == to {
+            return Err("a session cannot message itself".to_string());
+        }
+        let (from, target_idle) = {
+            let sessions = self.sessions.lock().unwrap();
+            let from = sessions
+                .get(session_id)
+                .ok_or_else(|| "the sending session is not on this desk".to_string())?
+                .title
+                .clone();
+            let target = sessions
+                .get(to)
+                .ok_or_else(|| format!("no session here with id {to}"))?;
+            if !target.live {
+                return Err(format!("「{}」 has no terminal any more", target.title));
+            }
+            (
+                from,
+                !matches!(target.status, Status::Running | Status::Starting),
+            )
+        };
+        let core = self
+            .core
+            .get()
+            .and_then(|w| w.upgrade())
+            .ok_or_else(|| "this desk is shutting down".to_string())?;
+        core.enqueue_followup(to, text, Some(from))
+            .map_err(|e| format!("{e:#}"))?;
+
+        // What the sender is doing, said the way the board already says it.
+        // A session posting to this endpoint is inside a shell tool, so its
+        // own PreToolUse reported `Bash` with a curl line — true, and useless
+        // on a card about which agents are talking to each other. Rewritten
+        // into the arrow shape `activity_from_payload` already gives Claude
+        // Code's own SendMessage, so the two channels read alike.
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            let to_title = sessions.get(to).map(|s| s.title.clone()).unwrap_or_default();
+            if let Some(sender) = sessions.get_mut(session_id) {
+                let what: String = text.chars().take(120).collect();
+                sender.activity = Some(Activity {
+                    tool: "SendMessage".to_string(),
+                    detail: format!("→ {to_title}: {what}").chars().take(160).collect(),
+                });
+                sender.activity_since = now_ms();
+            }
+        }
+        self.broadcast();
+
+        if target_idle {
+            core.flush_followup(to);
+        }
+        Ok(())
+    }
+
     /// A session saying what it should be called.
     ///
     /// The rename writes to SQLite, and the iron law of this path is that an
@@ -1190,12 +1328,20 @@ pub struct Core {
     /// button is idempotent and the shells never pile up. In-memory only:
     /// a shell does not outlive the app any more than the PTYs do.
     shells: Mutex<HashMap<String, String>>,
-    /// One message per session, held for the end of its turn. Typing into
-    /// a running claude steers the turn in flight; this is the other thing
-    /// a person means — "when you are done, then this". Latest wins, and
-    /// like the shells it is transient: the turn it waits on cannot
-    /// outlive the app either.
-    followups: Mutex<HashMap<String, String>>,
+    /// Messages held for the end of a session's turn. Typing into a running
+    /// claude steers the turn in flight; this is the other thing a person
+    /// means — "when you are done, then this". Like the shells it is
+    /// transient: the turn it waits on cannot outlive the app either.
+    ///
+    /// A queue rather than the single slot it used to be. One slot was right
+    /// while the only sender was the person in front of it, where a second
+    /// message plainly supersedes the first. It stops being right the moment
+    /// another *session* can send one: two peers writing to the same agent
+    /// would have had the second silently evict the first, with neither
+    /// sender told and no trace that a message ever existed.
+    followups: Mutex<HashMap<String, VecDeque<Pending>>>,
+    /// Per-session tokens for the peers/send channels. See `Router`.
+    send_tokens: Arc<Mutex<HashMap<String, String>>>,
     /// Everything known about each execution environment, resolved on first
     /// use and kept: a WSL distro's login environment costs a probe, and the
     /// answer does not change under a running app.
@@ -1262,11 +1408,19 @@ pub struct WorldProbe {
 /// as readily as on a WSL Ubuntu. An empty directory leaves the globs
 /// unexpanded and `[ -d ]` discards the literals, which is why there is no
 /// `nullglob` here to depend on.
-const LIST_DIR: &str = r#"pwd -P
+/// The resolved path, whether this is a checkout, then the directories.
+///
+/// Three answers, one crossing. The repository check used to be an `exists`
+/// of its own after the listing came back, which through a doorway is a
+/// second process for one bit — and the picker asks on every step of a walk
+/// down somebody's home directory.
+const LIST_DIR: &str = r#"pwd -P || exit 1
+[ -e .git ] && echo repo || echo plain
 for e in .* *; do
   case "$e" in .|..) continue;; esac
   [ -d "$e" ] && printf '%s\n' "$e"
-done"#;
+done
+exit 0"#;
 
 /// Where `..` goes from an absolute path, or `None` at a root.
 ///
@@ -1373,6 +1527,10 @@ pub struct HostEnv {
     /// the tunnel could not be raised — sessions run either way, they just
     /// show no status.
     pub hooks: Option<hooks::Wiring>,
+    /// The shells this world holds open, so a command costs a write rather
+    /// than a process. Empty for the local host, which has no doorway to
+    /// amortise — see `channel`.
+    pub channels: crate::channel::Channels,
     /// What it takes to hold a session in this world past the app's own life,
     /// or `None` when this world cannot: no tmux in it, or nowhere to put the
     /// config. Resolved beside the environment probe, because both answer
@@ -1403,6 +1561,38 @@ pub struct WorldHold {
 /// Three strings rather than a command, because the command has to be built
 /// twice — once to start or reattach, once to end — and both have to go
 /// through the world's doorway on the way out.
+/// One message waiting for a session's turn to end.
+///
+/// `from` is the whole difference between a person's follow-up and a peer's
+/// message: absent means the human typed it and it carries their authority,
+/// present means another session sent it and `prompt::peer_envelope` has to
+/// say so before it goes in.
+#[derive(Debug, Clone)]
+struct Pending {
+    text: String,
+    from: Option<String>,
+}
+
+impl Pending {
+    /// What actually goes into the terminal for this one.
+    fn rendered(&self) -> String {
+        match &self.from {
+            Some(from) => crate::prompt::peer_envelope(from, &self.text),
+            None => self.text.clone(),
+        }
+    }
+}
+
+/// How many messages may wait on one session before the desk starts refusing
+/// them.
+///
+/// A bound rather than a preference: the queue is drained by a turn ending,
+/// and a session that never ends a turn would otherwise collect messages for
+/// as long as the app runs. Refusing loudly at a limit is the honest failure
+/// — the alternative this replaced dropped the *older* message and told
+/// nobody.
+const MAX_PENDING: usize = 16;
+
 struct HoldPlan {
     /// Which socket, and in which of the two shapes. Carries the desk and the
     /// session, so two installs cannot collect each other's.
@@ -1424,6 +1614,7 @@ impl HostEnv {
             host: &self.host,
             local,
             env: &self.env,
+            channels: Some(&self.channels),
         }
     }
 }
@@ -1543,11 +1734,13 @@ impl Core {
             }
         }
 
+        let send_tokens: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
         let router = Arc::new(Router {
             sink: Arc::clone(&sink),
             locale: Arc::clone(&locale),
             notify_prefs: Arc::clone(&notify_prefs),
             sessions: Arc::clone(&sessions),
+            send_tokens: Arc::clone(&send_tokens),
             core: OnceLock::new(),
             events: events_tx,
         });
@@ -1558,6 +1751,7 @@ impl Core {
             store,
             ptys: PtyRegistry::new(),
             sessions,
+            send_tokens,
             tabs: Mutex::new(tabs),
             sink: Arc::clone(&sink),
             router: Arc::clone(&router),
@@ -1641,6 +1835,9 @@ impl Core {
                     plugin_dir: s.plugin_dir.to_string_lossy().to_string(),
                     url: s.url(),
                 }),
+                // Nothing to amortise: a local command is already a fork, and
+                // `sh` is not on a Windows login-shell PATH.
+                channels: crate::channel::Channels::default(),
                 hold: self.local_hold(),
             },
             _ => {
@@ -1649,10 +1846,14 @@ impl Core {
                     anyhow!("the host's environment came back without a HOME")
                 })?;
                 // The host's CLIs, not ours — their versions gate their flags.
+                // No channel yet: this is the probe that decides whether the
+                // world is usable at all, and it runs while the `HostEnv`
+                // that would own one is still being built.
                 let hr = HostRef {
                     host: h,
                     local: &self.env,
                     env: &env,
+                    channels: None,
                 };
                 let probe = |exe: &str| {
                     hr.run_ok(exe, &["--version"], None)
@@ -1707,6 +1908,7 @@ impl Core {
                     versions,
                     worktree_root: format!("{home}/.marol/worktrees"),
                     hooks: wiring,
+                    channels: crate::channel::Channels::new(),
                     hold,
                 }
             }
@@ -2255,12 +2457,14 @@ impl Core {
             last_active_at: at,
             live: true,
             reports_status: false,
+            hooks_wired: false,
             activity: None,
             activity_since: 0,
             completed: false,
             attempt_id: Some(attempt_id.clone()),
             agent_session: true,
             has_followup: false,
+            pending_from: Vec::new(),
             preview_port: None,
             usage: None,
             transcript_path: None,
@@ -2425,12 +2629,14 @@ impl Core {
             last_active_at: at,
             live: true,
             reports_status: false,
+            hooks_wired: false,
             activity: None,
             activity_since: 0,
             completed: false,
             attempt_id: Some(attempt_id.to_string()),
             agent_session: true,
             has_followup: false,
+            pending_from: Vec::new(),
             preview_port: None,
             usage: None,
             transcript_path: None,
@@ -2768,6 +2974,7 @@ impl Core {
             last_active_at: at,
             live: true,
             reports_status: false,
+            hooks_wired: false,
             activity: None,
             activity_since: 0,
             completed: false,
@@ -2778,6 +2985,7 @@ impl Core {
             // ending it with the desk is what it is for.
             agent_session: false,
             has_followup: false,
+            pending_from: Vec::new(),
             // Reachable worlds only: local directly, WSL through mirrored
             // networking. An SSH host's port lives on the remote, and a
             // recorded port nobody can dial would put a preview button on
@@ -2903,6 +3111,7 @@ impl Core {
             last_active_at: at,
             live: true,
             reports_status: false,
+            hooks_wired: false,
             activity: None,
             activity_since: 0,
             completed: false,
@@ -2912,6 +3121,7 @@ impl Core {
             // And for the same reason, not held and not a loss on restart.
             agent_session: false,
             has_followup: false,
+            pending_from: Vec::new(),
             preview_port: None,
             usage: None,
             transcript_path: None,
@@ -3057,34 +3267,46 @@ impl Core {
             })
             .unwrap_or_else(|| vec![(String::new(), loc.path.clone())]);
 
+        // Every rules slot is decided in one crossing rather than one each.
+        // Six `test -e` calls was six processes through a doorway to answer
+        // six bits, and this tab is opened by a person who is waiting.
+        let mut slots: Vec<(&'static str, &'static str, &'static str, String, String)> =
+            Vec::new();
         for (dir, project) in &projects {
             for (name, agent) in agent::DOCS.project_rules {
-                let path = hr.join(project, name);
-                out.push(AgentDoc {
-                    scope: "project",
+                slots.push((
+                    "project",
                     agent,
-                    kind: "rules",
-                    dir: dir.clone(),
-                    exists: hr.exists(&path),
-                    name: name.to_string(),
-                    path,
-                });
+                    "rules",
+                    dir.clone(),
+                    hr.join(project, name),
+                ));
             }
         }
-
         if let Some(home) = home.as_deref() {
             for (dir, name, agent) in agent::DOCS.global_rules {
-                let path = hr.join(&hr.join(home, dir), name);
-                out.push(AgentDoc {
-                    scope: "global",
+                slots.push((
+                    "global",
                     agent,
-                    kind: "rules",
-                    dir: String::new(),
-                    exists: hr.exists(&path),
-                    name: name.to_string(),
-                    path,
-                });
+                    "rules",
+                    String::new(),
+                    hr.join(&hr.join(home, dir), name),
+                ));
             }
+        }
+        let paths: Vec<&str> = slots.iter().map(|(_, _, _, _, p)| p.as_str()).collect();
+        let present = hr.exist_all(&paths);
+        for ((scope, agent, kind, dir, path), exists) in slots.into_iter().zip(present) {
+            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+            out.push(AgentDoc {
+                scope,
+                agent,
+                kind,
+                dir,
+                exists,
+                name,
+                path,
+            });
         }
 
         // One directory per skill, each holding a SKILL.md. A directory
@@ -3106,23 +3328,25 @@ impl Core {
                     .map(|h| hr.join(&hr.join(h, dir), "skills"))
                     .unwrap_or_default(),
             ));
-            for (scope, where_, root) in roots {
-                if root.is_empty() {
-                    continue;
-                }
-                for entry in hr.list_dir(&root) {
+            // A listing plus one `test -e` per entry was the worst of these:
+            // somebody with twenty skills paid twenty-one crossings for one
+            // tab. `skills_in` asks each root for the names that actually
+            // hold a SKILL.md, and answers for every root at once.
+            let live: Vec<(&'static str, String, String)> =
+                roots.into_iter().filter(|(_, _, r)| !r.is_empty()).collect();
+            let listings = hr.skills_in(&live.iter().map(|(_, _, r)| r.as_str()).collect::<Vec<_>>());
+            for ((scope, where_, root), names) in live.into_iter().zip(listings) {
+                for entry in names {
                     let path = hr.join(&hr.join(&root, &entry), "SKILL.md");
-                    if hr.exists(&path) {
-                        out.push(AgentDoc {
-                            scope,
-                            agent,
-                            kind: "skill",
-                            dir: where_.clone(),
-                            exists: true,
-                            name: entry,
-                            path,
-                        });
-                    }
+                    out.push(AgentDoc {
+                        scope,
+                        agent,
+                        kind: "skill",
+                        dir: where_.clone(),
+                        exists: true,
+                        name: entry,
+                        path,
+                    });
                 }
             }
         }
@@ -3365,6 +3589,9 @@ impl Core {
                 .unwrap_or_else(|| "/".to_string()),
         };
 
+        // Answered by the listing itself for a world behind a doorway; still
+        // a filesystem question locally, where it costs nothing.
+        let mut remote_repo: Option<bool> = None;
         let (resolved, mut dirs) = match &he.host {
             // Locally this is a filesystem call, not a shell. Windows is the
             // reason: `sh` is not on a Windows login-shell PATH, and the one
@@ -3401,6 +3628,8 @@ impl Core {
                     .next()
                     .ok_or_else(|| anyhow!("{start} answered with nothing"))?
                     .to_string();
+                let is_repo = lines.next() == Some("repo");
+                remote_repo = Some(is_repo);
                 (resolved, lines.map(|s| s.to_string()).collect())
             }
         };
@@ -3416,7 +3645,10 @@ impl Core {
         });
 
         let parent = parent_of(&resolved);
-        let is_repo = hr.exists(&hr.join(&resolved, ".git"));
+        let is_repo = match remote_repo {
+            Some(answered) => answered,
+            None => hr.exists(&hr.join(&resolved, ".git")),
+        };
         Ok(DirListing {
             path: resolved,
             parent,
@@ -3737,6 +3969,30 @@ impl Core {
         Ok(())
     }
 
+    /// Deliver text into a live session's terminal without recording it.
+    ///
+    /// The seam exists because the flush has a different record to write than
+    /// the send does: several messages leave as one paste, but they arrived
+    /// separately and from different people, and a timeline that folded them
+    /// into one row attributed to nobody would be a worse record than none.
+    /// So the flush composes the delivery here and writes its own rows.
+    fn deliver(&self, session_id: &str, text: &str) -> Result<()> {
+        let agent = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions
+                .get(session_id)
+                .ok_or_else(|| anyhow!("no such session: {session_id}"))?
+                .agent
+                .clone()
+        };
+        if prompt::delivery_for(&agent) != Delivery::Positional {
+            return Err(anyhow!(
+                "`{agent}`'s input conventions have not been measured; copy the text in instead"
+            ));
+        }
+        self.write(session_id, &prompt::bracketed_followup(text))
+    }
+
     /// The repository's branches, recency first, for the base picker.
     pub fn list_branches(&self, repo_path: &str) -> Result<Vec<String>> {
         let (loc, he) = self.located(repo_path)?;
@@ -3767,37 +4023,125 @@ impl Core {
                 ));
             }
         }
-        self.followups
-            .lock()
-            .unwrap()
-            .insert(session_id.to_string(), text.to_string());
-        self.set_followup_flag(session_id, true);
+        self.enqueue_followup(session_id, text, None)
+    }
+
+    /// Put one message on a session's queue, from a person (`from` absent) or
+    /// from another session (`from` naming it).
+    ///
+    /// The refusal is the point of the cap: a caller that is told "full"
+    /// can say so to whoever sent the message, which is exactly what the
+    /// single slot could never do.
+    fn enqueue_followup(&self, session_id: &str, text: &str, from: Option<String>) -> Result<()> {
+        {
+            let mut queues = self.followups.lock().unwrap();
+            let queue = queues.entry(session_id.to_string()).or_default();
+            if queue.len() >= MAX_PENDING {
+                return Err(anyhow!(
+                    "{} already has {MAX_PENDING} messages waiting for its turn to end",
+                    session_id
+                ));
+            }
+            queue.push_back(Pending {
+                text: text.to_string(),
+                from,
+            });
+        }
+        self.refresh_pending(session_id);
         Ok(())
     }
 
     pub fn cancel_followup(&self, session_id: &str) {
         self.followups.lock().unwrap().remove(session_id);
-        self.set_followup_flag(session_id, false);
+        self.refresh_pending(session_id);
     }
 
     /// The Stop hook's half: the turn just ended, so what waited for it
     /// goes in as the next one — through the same paste a live follow-up
     /// uses, recorded on the timeline the same way.
     pub(crate) fn flush_followup(&self, session_id: &str) {
-        let Some(text) = self.followups.lock().unwrap().remove(session_id) else {
-            return;
+        let pending: Vec<Pending> = match self.followups.lock().unwrap().remove(session_id) {
+            Some(q) if !q.is_empty() => q.into(),
+            _ => return,
         };
-        if let Err(e) = self.send_followup(session_id, &text) {
+        // Coalesced into one delivery rather than sent one after another.
+        // Each send is a paste followed by a return, so a second one would
+        // land in the middle of the turn the first just started — the exact
+        // interleaving the end-of-turn queue exists to avoid. Several
+        // messages become several paragraphs of one turn.
+        let text = pending
+            .iter()
+            .map(Pending::rendered)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if let Err(e) = self.deliver(session_id, &text) {
             // The session died between queue and Stop. The message is
-            // dropped rather than retried into a terminal that is gone.
+            // dropped rather than retried into a terminal that is gone, and
+            // nothing is recorded — the timeline says what an agent was
+            // asked, and this was not asked of anyone.
             eprintln!("[core] queued follow-up for {session_id} failed: {e:#}");
+            self.refresh_pending(session_id);
+            return;
         }
-        self.set_followup_flag(session_id, false);
+
+        // One row per message, each under its own author. A relayed message
+        // filed as a `prompt` would have the record claim the person said
+        // something they did not — the same lie the envelope exists to stop,
+        // told to whoever reads the timeline afterwards instead of to the
+        // agent. The stored text is what was actually said, not the framed
+        // delivery: the frame is how it travelled, not what it was.
+        let attempt_id = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .and_then(|s| s.attempt_id.clone());
+        if let Some(id) = attempt_id {
+            let at = now_ms();
+            for p in &pending {
+                match &p.from {
+                    Some(from) => {
+                        let _ = self.store.append_event(
+                            &id,
+                            at,
+                            "message",
+                            Some(from),
+                            Some(&p.text),
+                        );
+                    }
+                    None => {
+                        let _ = self.store.append_event(&id, at, "prompt", None, Some(&p.text));
+                    }
+                }
+            }
+        }
+        self.refresh_pending(session_id);
     }
 
-    fn set_followup_flag(&self, session_id: &str, value: bool) {
+    /// Re-read what is waiting for this session and put it on the row.
+    ///
+    /// Derived rather than told. The flag used to be set by hand at each of
+    /// the three places that touch the queue, which was survivable while it
+    /// was one boolean and one slot; with senders to name it would have been
+    /// three chances for the row to disagree with the queue.
+    fn refresh_pending(&self, session_id: &str) {
+        let (has, from) = match self.followups.lock().unwrap().get(session_id) {
+            Some(q) => {
+                let mut from: Vec<String> = Vec::new();
+                for p in q {
+                    if let Some(f) = &p.from {
+                        if !from.contains(f) {
+                            from.push(f.clone());
+                        }
+                    }
+                }
+                (!q.is_empty(), from)
+            }
+            None => (false, Vec::new()),
+        };
         if let Some(s) = self.sessions.lock().unwrap().get_mut(session_id) {
-            s.has_followup = value;
+            s.has_followup = has;
+            s.pending_from = from;
         }
         self.broadcast();
     }
@@ -3915,6 +4259,7 @@ impl Core {
             last_active_at: at,
             live: true,
             reports_status: false,
+            hooks_wired: false,
             activity: None,
             activity_since: 0,
             completed: false,
@@ -3923,6 +4268,7 @@ impl Core {
             // and lost on the same terms as one with a card.
             agent_session: true,
             has_followup: false,
+            pending_from: Vec::new(),
             preview_port: None,
             usage: None,
             transcript_path: None,
@@ -4066,6 +4412,24 @@ impl Core {
                 "MAROL_NAME_URL".to_string(),
                 hooks::name_url(&wiring.url, id),
             ));
+            // The two channels a session can *ask* on, each carrying a token
+            // minted for this session alone. Minted fresh per launch, so a
+            // token learned from a session that has since been restarted
+            // stops working — and never stored, because it is worth exactly
+            // one running process.
+            let token = uuid::Uuid::new_v4().simple().to_string();
+            self.send_tokens
+                .lock()
+                .unwrap()
+                .insert(id.to_string(), token.clone());
+            session_env.push((
+                "MAROL_PEERS_URL".to_string(),
+                hooks::peers_url(&wiring.url, id, &token),
+            ));
+            session_env.push((
+                "MAROL_SEND_URL".to_string(),
+                hooks::send_url(&wiring.url, id, &token),
+            ));
         }
 
         // Whether this world can be wired at all was settled when the host
@@ -4077,6 +4441,14 @@ impl Core {
             (Some(cli), Some(wiring)) if cli.hooks_ok(he.versions.of(cli)) => cli.hook_args(wiring),
             _ => Vec::new(),
         };
+
+        // Recorded, not inferred later: this is the moment the answer is
+        // known, and it is the only moment — the version that decided it
+        // belongs to the world this session launched into, and nothing
+        // downstream can see that world again.
+        if let Some(s) = self.sessions.lock().unwrap().get_mut(id) {
+            s.hooks_wired = !hook_args.is_empty();
+        }
 
         // Cross-session messaging addresses a session by name, and left to
         // itself the CLI derives one from the worktree's directory — a slug
@@ -4393,6 +4765,12 @@ impl Core {
         // this process lives.
         if let Some(h) = self.hooks.get() {
             h.stop();
+        }
+        // Let go of every world's held shells. They are idle processes in
+        // somebody else's distro, kept alive only for this app's convenience,
+        // so they go when the convenience does.
+        for he in self.hosts.lock().unwrap().values() {
+            he.channels.close();
         }
         // Close the standing SSH connections, tunnels and all — with
         // ControlPersist they would otherwise outlive the app.
@@ -5455,6 +5833,7 @@ impl Core {
                 host: &Host::Local,
                 local: &self.env,
                 env: &self.env,
+                channels: None,
             };
             if !hr.is_dir(&loc.path) {
                 continue;
@@ -5992,12 +6371,14 @@ mod tests {
             last_active_at: 0,
             live: true,
             reports_status: false,
+            hooks_wired: false,
             activity: None,
             activity_since: 0,
             completed: false,
             attempt_id: None,
             agent_session: true,
             has_followup: false,
+            pending_from: Vec::new(),
             preview_port: None,
             usage: None,
             transcript_path: None,

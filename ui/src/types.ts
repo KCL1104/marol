@@ -87,8 +87,10 @@ export interface AttemptEvent {
   attempt_id: string;
   at: number;
   /** `prompt` — what it was asked. `tool` — what it reached for.
-      `status` — when it started waiting on you, or stopped. */
-  kind: 'prompt' | 'tool' | 'status' | string;
+      `status` — when it started waiting on you, or stopped.
+      `message` — what another session on this desk sent it, `tool` naming
+      which one. */
+  kind: 'prompt' | 'tool' | 'status' | 'message' | string;
   tool: string | null;
   detail: string | null;
 }
@@ -148,12 +150,21 @@ export interface SessionMeta {
   /** True once the status plugin has reported, so the UI can tell "idle" from
       "this CLI does not report status". */
   reports_status: boolean;
+  /** Whether this session's CLI was wired for status at launch. `reports_status`
+      says it has spoken; this says it was given a mouth. False means it never
+      will, so a card can say so at once rather than waiting out a silence with
+      no end. Per session because the answer is per world — see core.rs. */
+  hooks_wired: boolean;
   /** The attempt this session runs, or `null` for an ad-hoc session that
       lives outside the board. */
   attempt_id: string | null;
   /** A message is queued to go in when this turn ends. Transient — never
       stored, absent from restores. */
   has_followup?: boolean;
+  /** Who has a message waiting for this session's turn to end. Empty when the
+      only thing queued is the person's own note — "you left a note here" and
+      "two other agents are waiting on this one" are different facts. */
+  pending_from?: string[];
   /** The $MAROL_PORT a run script was handed, when reachable from the
       app (local and WSL; an SSH host's port lives on the remote). Transient
       — the server dies with the PTY. */

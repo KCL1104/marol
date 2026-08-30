@@ -519,7 +519,14 @@ export function AttemptInspector({
           mind before Stop spends it. */}
       {session?.has_followup && (
         <p className="queued-banner" data-testid="queued-followup">
-          <span>{t('inspector.queued')}</span>
+          {/* Whose message, when it is not yours. A note you left yourself
+              and a queue two other agents are waiting on are different
+              situations, and the one sentence used to describe both. */}
+          <span>
+            {session.pending_from && session.pending_from.length > 0
+              ? t('inspector.queuedFrom', { who: session.pending_from.join(t('common.listSep')) })
+              : t('inspector.queued')}
+          </span>
           <button
             className="chip"
             data-testid="cancel-followup"
@@ -1518,7 +1525,9 @@ function Timeline({
       {rows.map((e, i) => (
         <li
           key={`${e.at}-${i}`}
-          className={`tl-row tl-${e.kind}${e.tool === 'SendMessage' ? ' tl-send' : ''}`}
+          className={`tl-row tl-${e.kind}${
+            e.tool === 'SendMessage' || e.kind === 'message' ? ' tl-send' : ''
+          }`}
           data-kind={e.kind}
         >
           <span className="tl-time mono small muted">{clock(e.at)}</span>
@@ -1553,6 +1562,21 @@ function Timeline({
                 </span>
               )}
             </span>
+          ) : e.kind === 'message' ? (
+            /* Not a prompt. Somebody else's agent said this, and the row
+               says so — the same honesty the envelope carries into the
+               terminal, kept for whoever reads the record afterwards. No
+               ↩ beside it: a restore is anchored to a turn the person
+               started, and this is not one of those. */
+            <>
+              <span className="tl-tool mono">
+                <span aria-hidden="true">← </span>
+                {e.tool}
+              </span>
+              <span className="tl-detail mono small muted" title={e.detail ?? undefined}>
+                {e.detail}
+              </span>
+            </>
           ) : (
             <>
               <span className="tl-prompt">{e.detail}</span>

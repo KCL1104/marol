@@ -55,6 +55,7 @@ function session(over: Partial<SessionMeta> & { id: string }): SessionMeta {
     last_active_at: 1000,
     live: true,
     reports_status: true,
+    hooks_wired: true,
     activity: null,
     activity_since: 0,
     completed: false,

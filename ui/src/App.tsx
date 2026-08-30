@@ -64,6 +64,7 @@ import { CoachMark } from './components/CoachMark';
 import { CommandPalette } from './components/CommandPalette';
 import { clearCoachSeen, coachSeen, markCoachSeen, type CoachId } from './coach';
 import type { ActionCtx, ActionId } from './actions';
+import { rememberFolded, storedFolded } from './sidebar';
 import { useSize } from './useSize';
 
 /** Terminals start at a sane size; the pane refits within a frame of mounting. */
@@ -113,6 +114,16 @@ export default function App() {
   const [renameTabId, setRenameTabId] = useState<string | null>(null);
   const [showNew, setShowNew] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  /** The sidebar, folded down to its rail. Remembered across restarts: a
+   *  person who wants the width back has said so about their desk, not about
+   *  this session. */
+  const [sidebarFolded, setSidebarFolded] = useState(storedFolded);
+  const toggleSidebar = useCallback(() => setSidebarFolded((v) => !v), []);
+  // Written from an effect rather than from inside the updater: an updater is
+  // allowed to run twice, and a setter is not the place for the disk.
+  useEffect(() => {
+    rememberFolded(sidebarFolded);
+  }, [sidebarFolded]);
   /** Errors stack instead of overwriting: parallel agents fail in parallel,
    *  and the second failure must not eat the first. Good news dismisses
    *  itself; a problem waits to be read. */
@@ -780,6 +791,12 @@ export default function App() {
           e.preventDefault();
           void onOpen(backTo);
         }
+      } else if ((e.key === 'b' || e.key === 'B') && !shellsOwn) {
+        // The chord every editor with a side bar uses. Ctrl+B is readline's
+        // backward-char, so from inside a terminal it is Ctrl+Shift+B —
+        // the same rule E, L, F and I already follow, applied by `shellsOwn`.
+        e.preventDefault();
+        toggleSidebar();
       } else if ((e.key === 'k' || e.key === 'K') && !shellsOwn) {
         e.preventDefault();
         paletteReturn.current = document.activeElement as HTMLElement | null;
@@ -848,6 +865,7 @@ export default function App() {
     members,
     focusedId,
     backTo,
+    toggleSidebar,
   ]);
 
   /* ------------------------------ board ----------------------------- */
@@ -1135,6 +1153,9 @@ export default function App() {
         case 'new-session':
           setShowNew(true);
           break;
+        case 'toggle-sidebar':
+          toggleSidebar();
+          break;
         case 'toggle-inspector':
           // The drawer lives beside the terminals; opening it from another
           // view brings the terminals with it.
@@ -1168,7 +1189,18 @@ export default function App() {
           break;
       }
     },
-    [sessions, focusedId, onOpen, inspectId, activeAttemptId, reopenWelcome, backTo, pushToast, t],
+    [
+      sessions,
+      focusedId,
+      onOpen,
+      inspectId,
+      activeAttemptId,
+      reopenWelcome,
+      backTo,
+      pushToast,
+      t,
+      toggleSidebar,
+    ],
   );
 
   const paletteCancel = useCallback(() => {
@@ -1184,7 +1216,10 @@ export default function App() {
 
   return (
     <div
-      className="app"
+      // The fold is a grid-track change, deliberately with no transition:
+      // animating it would resize every terminal pane on every frame, and a
+      // TUI answers a resize by reflowing itself. One layout, once.
+      className={`app${sidebarFolded ? ' sidebar-folded' : ''}`}
       // Bubble phase, not capture: the source sets the payload in its own
       // handler, so during capture `types` is still empty.
       onDragStart={(e) => setDragging(e.dataTransfer.types.includes(DRAG_MIME))}
@@ -1202,6 +1237,8 @@ export default function App() {
         onComplete={(id, completed) => void api.setCompleted(id, completed)}
         onRename={(id, title) => void api.renameSession(id, title)}
         onShowSettings={() => setShowSettings(true)}
+        folded={sidebarFolded}
+        onToggleFold={toggleSidebar}
       />
 
       <main className="main">

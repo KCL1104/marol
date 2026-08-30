@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 #[path = "../src/agent.rs"]
 mod agent;
+#[path = "../src/channel.rs"]
+mod channel;
 #[path = "../src/config.rs"]
 mod config;
 #[path = "../src/core.rs"]
@@ -95,7 +97,7 @@ struct Harness {
 /// test's boot by the probe's timeout.
 const STUB: &str = r#"#!/bin/bash
 if [ "$1" = "--version" ]; then echo "2.1.226 (Claude Code)"; exit 0; fi
-printf '%s\0' "$PWD" "${MAROL_NAME_URL:-}" "$@" > "$MAROL_STUB_LOG/${MAROL_SESSION_ID:-unknown}.$$"
+printf '%s\0' "$PWD" "${MAROL_NAME_URL:-}" "${MAROL_PEERS_URL:-}" "${MAROL_SEND_URL:-}" "$@" > "$MAROL_STUB_LOG/${MAROL_SESSION_ID:-unknown}.$$"
 # 宣告它所替身的那個 CLI 真的會宣告的模式:Claude Code 開啟 bracketed
 # paste(DECSET 2004),而 `bracketed_followup` 只送給量測過會開它的 CLI。
 # 這一行之前 stub 是個沉默的位元組水槽,而任何會照 2004 決定要不要轉發
@@ -113,7 +115,7 @@ exec cat > "$MAROL_STUB_LOG/stdin.${MAROL_SESSION_ID:-unknown}.$$"
 /// that shape pass.
 const CODEX_STUB: &str = r#"#!/bin/bash
 if [ "$1" = "--version" ]; then echo "codex-cli 0.147.0"; exit 0; fi
-printf '%s\0' "$PWD" "${MAROL_NAME_URL:-}" "$@" > "$MAROL_STUB_LOG/${MAROL_SESSION_ID:-unknown}.$$"
+printf '%s\0' "$PWD" "${MAROL_NAME_URL:-}" "${MAROL_PEERS_URL:-}" "${MAROL_SEND_URL:-}" "$@" > "$MAROL_STUB_LOG/${MAROL_SESSION_ID:-unknown}.$$"
 printf '\033[?2004h'
 exec cat > "$MAROL_STUB_LOG/stdin.${MAROL_SESSION_ID:-unknown}.$$"
 "#;
@@ -122,7 +124,7 @@ exec cat > "$MAROL_STUB_LOG/stdin.${MAROL_SESSION_ID:-unknown}.$$"
 /// given for the tests that assert it was given nothing of ours.
 const UNMEASURED_STUB: &str = r#"#!/bin/bash
 if [ "$1" = "--version" ]; then echo "0.9.0"; exit 0; fi
-printf '%s\0' "$PWD" "${MAROL_NAME_URL:-}" "$@" > "$MAROL_STUB_LOG/${MAROL_SESSION_ID:-unknown}.$$"
+printf '%s\0' "$PWD" "${MAROL_NAME_URL:-}" "${MAROL_PEERS_URL:-}" "${MAROL_SEND_URL:-}" "$@" > "$MAROL_STUB_LOG/${MAROL_SESSION_ID:-unknown}.$$"
 exec cat > "$MAROL_STUB_LOG/stdin.${MAROL_SESSION_ID:-unknown}.$$"
 "#;
 
@@ -130,7 +132,7 @@ exec cat > "$MAROL_STUB_LOG/stdin.${MAROL_SESSION_ID:-unknown}.$$"
 /// What matters is what it is NOT handed: `--name` would stop it starting.
 const OLD_STUB: &str = r#"#!/bin/bash
 if [ "$1" = "--version" ]; then echo "2.0.14 (Claude Code)"; exit 0; fi
-printf '%s\0' "$PWD" "${MAROL_NAME_URL:-}" "$@" > "$MAROL_STUB_LOG/${MAROL_SESSION_ID:-unknown}.$$"
+printf '%s\0' "$PWD" "${MAROL_NAME_URL:-}" "${MAROL_PEERS_URL:-}" "${MAROL_SEND_URL:-}" "$@" > "$MAROL_STUB_LOG/${MAROL_SESSION_ID:-unknown}.$$"
 exec cat > "$MAROL_STUB_LOG/stdin.${MAROL_SESSION_ID:-unknown}.$$"
 "#;
 
@@ -207,6 +209,11 @@ impl Harness {
 export PATH="{path}"
 export HOME="{home}"
 export MAROL_STUB_LOG="{logs}"
+# One line per crossing, whatever the argv contains. Every process through
+# this door is the thing the batched reads exist to avoid, so the tests can
+# count them — and a script argument with newlines in it must not read as
+# several crossings, which is exactly what a batched read passes.
+printf '%s\n' "$(printf '%s ' "$@" | tr '\n' ' ')" >> "{logs}/wsl-calls"
 while [ $# -gt 0 ]; do
   case "$1" in
     -d|--shell-type) shift 2 ;;
@@ -335,10 +342,11 @@ exec "$@"
                     if parts.last().is_some_and(|s| s.is_empty()) {
                         parts.pop();
                     }
-                    // The working directory and the naming endpoint, then
-                    // argv. A record missing either header is a half-written
-                    // file caught mid-`printf`, not a launch.
-                    if parts.len() < 2 {
+                    // The working directory, the naming endpoint and the two
+                    // messaging endpoints, then argv. A record missing any of
+                    // those headers is a half-written file caught
+                    // mid-`printf`, not a launch.
+                    if parts.len() < 4 {
                         continue;
                     }
                     let when = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
@@ -347,6 +355,8 @@ exec "$@"
                         Launch {
                             cwd: parts.remove(0),
                             name_url: parts.remove(0),
+                            peers_url: parts.remove(0),
+                            send_url: parts.remove(0),
                             args: parts,
                         },
                     ));
@@ -412,6 +422,21 @@ exec "$@"
     fn wait_for_title(&self, id: &str, want: &str) -> String {
         wait_for(Duration::from_secs(5), || self.session(id).title == want);
         self.session(id).title
+    }
+
+    /// Forget every crossing so far, so the next count measures one act.
+    fn reset_crossings(&self) {
+        let _ = std::fs::remove_file(self.root.join("logs").join("wsl-calls"));
+    }
+
+    /// How many times the stand-in `wsl.exe` has been run since the reset.
+    ///
+    /// The number Phase 1 is about: locally each of these is a fork nobody
+    /// notices, and through a real `wsl.exe` it is a Windows process.
+    fn crossings(&self) -> Vec<String> {
+        std::fs::read_to_string(self.root.join("logs").join("wsl-calls"))
+            .map(|t| t.lines().map(str::to_string).collect())
+            .unwrap_or_default()
     }
 
     /// Post a hook report the way Claude Code's own hook runner would.
@@ -553,6 +578,10 @@ struct Launch {
     /// environment the process actually got. Empty when the world had no
     /// listener to point at — which is the honest answer, not a failure.
     name_url: String,
+    /// The two channels a session can ask on, each already carrying this
+    /// session's own token. Empty for the same reason `name_url` is.
+    peers_url: String,
+    send_url: String,
     args: Vec<String>,
 }
 
@@ -1640,6 +1669,81 @@ fn a_followup_to_an_unmeasured_cli_is_refused_rather_than_guessed() {
     assert_eq!(rows.len(), 1, "a refused send still reached the timeline: {rows:?}");
 }
 
+/// The queue is a queue now, and that is what a second sender needs.
+///
+/// It used to be one slot per session: a second message overwrote the first,
+/// with neither sender told and no trace the older one ever existed. Fine
+/// while the only sender was the person in front of it; not fine the moment
+/// another session can send one.
+#[test]
+fn several_queued_messages_all_arrive_and_keep_their_order() {
+    let h = Harness::new("fuqueue");
+    let _guard = h.rt.enter();
+    let task = h.card("Fix login", "make it work");
+    let a = h.start(&task, "claude");
+    h.launches(&a.session_id, 1);
+
+    h.core.queue_followup(&a.session_id, "first thing").expect("queue 1");
+    h.core.queue_followup(&a.session_id, "second thing").expect("queue 2");
+    assert!(h.core.sessions().iter().any(|s| s.id == a.session_id && s.has_followup));
+
+    // The turn ends: Stop is what drains the queue.
+    h.hook(&a.session_id, "idle", serde_json::json!({}));
+
+    let stdin = h.stdin_when(&a.session_id, |s| s.contains("second thing"));
+    let first = stdin.find("first thing").expect("the older message was dropped");
+    let second = stdin.find("second thing").expect("the newer message was dropped");
+    assert!(first < second, "the queue did not keep its order: {stdin:?}");
+    // Coalesced into ONE turn: a second paste would land inside the turn the
+    // first just started, which is the interleaving the queue exists to stop.
+    assert_eq!(
+        stdin.matches("\u{1b}[200~").count(),
+        1,
+        "the queue was delivered as more than one turn: {stdin:?}"
+    );
+
+    // Drained, so the row stops advertising a message that already went.
+    let settled = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < settled {
+        if h.core.sessions().iter().any(|s| s.id == a.session_id && !s.has_followup) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("the follow-up flag survived the flush");
+}
+
+/// The bound exists so a session that never ends a turn cannot collect
+/// messages for as long as the app runs — and the refusal is the feature:
+/// a caller told "full" can say so to whoever sent it, which the single slot
+/// could never do.
+#[test]
+fn a_full_queue_refuses_rather_than_dropping_the_oldest() {
+    let h = Harness::new("fufull");
+    let _guard = h.rt.enter();
+    let task = h.card("Fix login", "make it work");
+    let a = h.start(&task, "claude");
+    h.launches(&a.session_id, 1);
+
+    for i in 0..16 {
+        h.core
+            .queue_followup(&a.session_id, &format!("message {i}"))
+            .unwrap_or_else(|e| panic!("message {i} should have fitted: {e}"));
+    }
+    let err = h
+        .core
+        .queue_followup(&a.session_id, "one too many")
+        .expect_err("the seventeenth should not have fitted");
+    assert!(err.to_string().contains("16"), "the refusal hides the limit: {err}");
+
+    // And the one that was refused is the one that is missing — the first is
+    // still there, which is the whole point of refusing at the back.
+    h.hook(&a.session_id, "idle", serde_json::json!({}));
+    let stdin = h.stdin_when(&a.session_id, |s| s.contains("message 15"));
+    assert!(stdin.contains("message 0"), "the oldest was evicted after all: {stdin:?}");
+    assert!(!stdin.contains("one too many"), "a refused message was sent: {stdin:?}");
+}
+
 #[test]
 fn an_empty_followup_is_not_sent() {
     let h = Harness::new("fuempty");
@@ -1648,6 +1752,344 @@ fn an_empty_followup_is_not_sent() {
     let a = h.start(&task, "claude");
 
     assert!(h.core.send_followup(&a.session_id, "  \n").is_err());
+}
+
+/* ---------------------------- crossings -------------------------------- */
+
+/// What the two perf phases actually bought, counted rather than described.
+///
+/// Phase 1 made each read cost a process per *answer* instead of one per
+/// question. Phase 2 took the process away: the world holds a shell open, so
+/// a read is a line written to a pipe. Together they are the difference
+/// between a card that costs thirty Windows processes on a timer and one that
+/// costs none.
+///
+/// Zero rather than a small number, and exact rather than a bound. A bound
+/// would let a regression put one crossing back per card per fifteen seconds
+/// and still pass — which is precisely the shape of the bug being prevented.
+///
+/// The shell itself is a process, paid once for the life of the world; by the
+/// time an attempt has been started its world has long since been reached, so
+/// what is measured here is the steady state a running desk actually lives in.
+#[test]
+fn a_read_through_a_doorway_costs_no_process_at_all() {
+    let h = Harness::new("crossings");
+    let _guard = h.rt.enter();
+
+    let repo_url = format!("wsl://TestOS{}", h.repo.display());
+    let task = h
+        .core
+        .create_task("修好登入".into(), "make it work".into(), repo_url, "main".into(), Vec::new())
+        .expect("a wsl:// card");
+    let a = h.start(&task, "claude");
+    // The launch is its own crossing and it happens on a thread; waiting for
+    // it to be recorded is what stops it being counted against the read that
+    // follows.
+    h.launches(&a.session_id, 1);
+    let inner = a.worktree_path.strip_prefix("wsl://TestOS").unwrap().to_string();
+
+    // Untracked files are the ones that used to cost a crossing each: the
+    // count came from `git diff --no-index` per file, in a loop on this side
+    // of the door.
+    for n in 0..5 {
+        std::fs::write(Path::new(&inner).join(format!("new{n}.txt")), "hello\n").unwrap();
+    }
+
+    // The board's timer, which asks for this per open attempt every 15s.
+    h.reset_crossings();
+    let stat = h.core.attempt_stats(&a.attempt_id).expect("stats");
+    let calls = h.crossings();
+    assert!(
+        calls.is_empty(),
+        "the footprint cost {} crossings: {calls:#?}",
+        calls.len()
+    );
+    // And it is still the right answer, five untracked files included.
+    assert_eq!(stat.files, 5, "{stat:?}");
+
+    // The diff, which the drawer asks for on open.
+    h.reset_crossings();
+    let diff = h.core.attempt_diff(&a.attempt_id).expect("diff");
+    let calls = h.crossings();
+    assert!(calls.is_empty(), "the diff cost {} crossings: {calls:#?}", calls.len());
+    assert!(diff.contains("new4.txt"), "the untracked files left the diff: {diff}");
+
+    // The Knows tab: six rules slots and two skill roots, which used to be
+    // six crossings plus a listing and a test per skill.
+    std::fs::create_dir_all(Path::new(&inner).join(".claude/skills/tidy")).unwrap();
+    std::fs::write(Path::new(&inner).join(".claude/skills/tidy/SKILL.md"), "x").unwrap();
+    std::fs::create_dir_all(Path::new(&inner).join(".claude/skills/notes")).unwrap();
+    h.reset_crossings();
+    let docs = h.core.agent_docs(&a.worktree_path).expect("docs");
+    let calls = h.crossings();
+    assert!(
+        calls.is_empty(),
+        "the Knows tab cost {} crossings: {calls:#?}",
+        calls.len()
+    );
+    // A directory without a SKILL.md is somebody's notes, not a skill.
+    let skills: Vec<&str> = docs
+        .iter()
+        .filter(|d| d.kind == "skill")
+        .map(|d| d.name.as_str())
+        .collect();
+    assert_eq!(skills, vec!["tidy"], "{docs:#?}");
+    // And the rules slots are all still answered, present and absent alike.
+    assert!(docs.iter().any(|d| d.name == "CLAUDE.md" && d.kind == "rules"));
+
+    // The folder picker, one step of a walk.
+    h.reset_crossings();
+    let listing = h.core.list_dir("wsl://TestOS", Some(&inner)).expect("list");
+    let calls = h.crossings();
+    assert!(calls.is_empty(), "one step cost {} crossings: {calls:#?}", calls.len());
+    assert!(listing.is_repo, "the worktree did not read as a checkout");
+    // The listing survives a directory whose *last* entry is a plain file.
+    // The script ends in a `for` loop, so its own exit status used to be the
+    // last `[ -d ]` test — and a folder ending in a file therefore answered
+    // "cannot be opened". Latent until something looked into a directory
+    // shaped like this one.
+    assert!(
+        listing.dirs.iter().any(|d| d == ".claude"),
+        "the walk stopped early: {:?}",
+        listing.dirs
+    );
+    assert!(
+        !listing.dirs.iter().any(|d| d.ends_with(".txt")),
+        "a plain file was offered as a directory: {:?}",
+        listing.dirs
+    );
+
+    // Held, not re-opened. A pool that started a shell per call would answer
+    // every assertion above and still be the thing this replaced.
+    h.reset_crossings();
+    for _ in 0..20 {
+        h.core.attempt_stats(&a.attempt_id).expect("stats");
+    }
+    let calls = h.crossings();
+    assert!(
+        calls.is_empty(),
+        "twenty reads opened {} shells: {calls:#?}",
+        calls.len()
+    );
+}
+
+/* -------------------------- session to session ------------------------- */
+
+/// A tiny HTTP client, because the sender under test is a `curl` one-liner
+/// and the thing worth checking is exactly what that one-liner would get
+/// back — a status line and a plain-text body.
+fn post(url: &str, headers: &[(&str, &str)], body: &str) -> (String, String) {
+    use std::io::{Read as _, Write as _};
+    let rest = url.trim_start_matches("http://");
+    let (addr, path) = rest.split_once('/').expect("url has a path");
+    let extra: String = headers
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}\r\n"))
+        .collect();
+    let mut sock = std::net::TcpStream::connect(addr).expect("connect to the listener");
+    let req = format!(
+        "POST /{path} HTTP/1.1\r\nHost: localhost\r\n{extra}content-length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    sock.write_all(req.as_bytes()).unwrap();
+    let mut resp = String::new();
+    let _ = sock.read_to_string(&mut resp);
+    let (head, body) = resp.split_once("\r\n\r\n").unwrap_or((resp.as_str(), ""));
+    let status = head.lines().next().unwrap_or_default().to_string();
+    (status, body.to_string())
+}
+
+fn get(url: &str) -> (String, String) {
+    use std::io::{Read as _, Write as _};
+    let rest = url.trim_start_matches("http://");
+    let (addr, path) = rest.split_once('/').expect("url has a path");
+    let mut sock = std::net::TcpStream::connect(addr).expect("connect to the listener");
+    sock.write_all(format!("GET /{path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+        .unwrap();
+    let mut resp = String::new();
+    let _ = sock.read_to_string(&mut resp);
+    let (head, body) = resp.split_once("\r\n\r\n").unwrap_or((resp.as_str(), ""));
+    (head.lines().next().unwrap_or_default().to_string(), body.to_string())
+}
+
+/// The whole bridge, end to end and across CLIs: a codex session lists the
+/// desk, finds a claude session by id, writes to it, and the message lands in
+/// that session's terminal wearing the frame that says whose it is.
+///
+/// Cross-CLI is the point rather than a variation. Claude Code's own
+/// cross-session messaging cannot do this at all — it is Claude Code's, and
+/// per machine besides — so this is the case the desk's own channel exists
+/// for.
+#[test]
+fn a_codex_session_can_message_a_claude_session_and_it_arrives_marked() {
+    let h = Harness::new("bridge");
+    let _guard = h.rt.enter();
+
+    let t1 = h.card("Fix login", "make it work");
+    let a1 = h.start(&t1, "claude");
+    let claude = h.launches(&a1.session_id, 1);
+    let t2 = h.card("Port the tests", "port them");
+    let a2 = h.start(&t2, "codex");
+    let codex = h.launches(&a2.session_id, 1);
+
+    // Both were handed the two endpoints, each with its own token.
+    assert!(!codex[0].send_url.is_empty(), "codex got no send endpoint");
+    assert!(!claude[0].send_url.is_empty(), "claude got no send endpoint");
+    assert_ne!(
+        codex[0].send_url, claude[0].send_url,
+        "two sessions were handed the same address"
+    );
+
+    // The codex session looks around. It sees the claude session and not
+    // itself — an address list holding your own address invites a loop.
+    let (status, listing) = get(&codex[0].peers_url);
+    assert!(status.contains("200"), "peers refused: {status}");
+    assert!(
+        listing.contains(&a1.session_id),
+        "the claude session is not on the list: {listing:?}"
+    );
+    assert!(
+        !listing.contains(&a2.session_id),
+        "a session was offered its own address: {listing:?}"
+    );
+
+    // And writes to it, addressing by the id the listing gave.
+    let (status, reply) = post(
+        &codex[0].send_url,
+        &[("X-Marol-To", &a1.session_id)],
+        "auth.py is mine — do not touch it",
+    );
+    assert!(status.contains("200"), "send refused: {status} {reply}");
+
+    // It arrives in the claude session's terminal, framed.
+    let stdin = h.stdin_when(&a1.session_id, |s| s.contains("do not touch it"));
+    assert!(stdin.contains("[marol]"), "the message wore no frame: {stdin:?}");
+    assert!(
+        stdin.contains("Not from the person"),
+        "the frame does not disclaim the person: {stdin:?}"
+    );
+    assert!(
+        stdin.contains("Port the tests"),
+        "the frame does not name the sender: {stdin:?}"
+    );
+
+    // And the record says who actually spoke. Filed as a `prompt` it would
+    // have the timeline claim the person said this — the same lie the frame
+    // stops in the terminal, told instead to whoever reads the record later.
+    // Found by kind rather than by position: the `idle` that drains the
+    // queue also writes a status row, both stamped the same millisecond from
+    // different threads, so "the last row" is a coin toss.
+    let rows = h.timeline(&a1.attempt_id, 2);
+    let msg = rows
+        .iter()
+        .find(|r| r.kind == "message")
+        .unwrap_or_else(|| panic!("no relayed-message row: {rows:?}"));
+    assert_eq!(msg.kind, "message", "a relayed message was filed as: {msg:?}");
+    // The sender's row name, which is the card title plus its attempt number
+    // — the name the person actually sees in the sidebar, not the card's.
+    assert_eq!(msg.tool.as_deref(), Some("Port the tests #1"), "{msg:?}");
+    // The stored text is what was said, not how it travelled: the frame is
+    // delivery, and a record of it would be a record of our own plumbing.
+    assert_eq!(msg.detail.as_deref(), Some("auth.py is mine — do not touch it"));
+    assert!(!msg.detail.as_deref().unwrap_or_default().contains("[marol]"));
+
+    // The sender's own card says whom it is talking to, in the shape the
+    // board already uses for Claude Code's native SendMessage.
+    let sender = h
+        .core
+        .sessions()
+        .into_iter()
+        .find(|s| s.id == a2.session_id)
+        .expect("the sending session");
+    let act = sender.activity.expect("the sender reports no activity");
+    assert_eq!(act.tool, "SendMessage");
+    assert!(act.detail.starts_with("→ Fix login"), "{:?}", act.detail);
+}
+
+/// A person's own follow-up is still the person's. The queue carries both
+/// kinds now, and the row each one leaves has to say which it was.
+#[test]
+fn a_persons_followup_is_still_recorded_as_a_prompt() {
+    let h = Harness::new("bridgemine");
+    let _guard = h.rt.enter();
+    let task = h.card("Fix login", "make it work");
+    let a = h.start(&task, "claude");
+    h.launches(&a.session_id, 1);
+
+    h.core.queue_followup(&a.session_id, "one more thing").expect("queue");
+    h.hook(&a.session_id, "idle", serde_json::json!({}));
+    h.stdin_when(&a.session_id, |s| s.contains("one more thing"));
+
+    let rows = h.timeline(&a.attempt_id, 2);
+    let note = rows
+        .iter()
+        .find(|r| r.detail.as_deref() == Some("one more thing"))
+        .unwrap_or_else(|| panic!("the note never reached the record: {rows:?}"));
+    assert_eq!(note.kind, "prompt", "the person's own note was reattributed: {note:?}");
+    assert_eq!(note.tool, None);
+    assert!(
+        !rows.iter().any(|r| r.kind == "message"),
+        "a person's note was filed as a relay: {rows:?}"
+    );
+    // And it wears no envelope — it *is* the person.
+    let stdin = h.stdin_when(&a.session_id, |s| s.contains("one more thing"));
+    assert!(!stdin.contains("[marol]"), "a person's note was framed as a relay: {stdin:?}");
+}
+
+/// The token is what turns `sid` from a guess into an identity. Without the
+/// check, any session on the desk could read a sibling's uuid and write to
+/// the board on its behalf — this channel puts text into another agent, so
+/// an address anything can guess is not enough to stand behind it.
+#[test]
+fn a_borrowed_address_without_its_token_is_refused() {
+    let h = Harness::new("bridgetok");
+    let _guard = h.rt.enter();
+    let t1 = h.card("Fix login", "make it work");
+    let a1 = h.start(&t1, "claude");
+    h.launches(&a1.session_id, 1);
+    let t2 = h.card("Port the tests", "port them");
+    let a2 = h.start(&t2, "codex");
+    let codex = h.launches(&a2.session_id, 1);
+
+    let forged = codex[0]
+        .send_url
+        .split("&tok=")
+        .next()
+        .map(|head| format!("{head}&tok=00000000000000000000000000000000&send=1"))
+        .expect("the endpoint carries a token at all");
+    let (status, body) = post(&forged, &[("X-Marol-To", &a1.session_id)], "let me in");
+    assert!(status.contains("409"), "a forged token was accepted: {status}");
+    assert!(body.contains("token"), "the refusal does not say why: {body:?}");
+
+    // And nothing reached the terminal.
+    std::thread::sleep(Duration::from_millis(300));
+    let stdin = h.stdin_when(&a1.session_id, |_| true);
+    assert!(!stdin.contains("let me in"), "a forged message got through: {stdin:?}");
+}
+
+/// A refusal is an answer, not a silence: the sender is an agent that can act
+/// on it. Every way a send can fail names itself.
+#[test]
+fn every_refused_send_hands_back_a_reason() {
+    let h = Harness::new("bridgewhy");
+    let _guard = h.rt.enter();
+    let t1 = h.card("Fix login", "make it work");
+    let a1 = h.start(&t1, "claude");
+    let claude = h.launches(&a1.session_id, 1);
+
+    // A session that is not here.
+    let (status, body) = post(
+        &claude[0].send_url,
+        &[("X-Marol-To", "11111111-2222-3333-4444-555555555555")],
+        "hello?",
+    );
+    assert!(status.contains("409"), "{status}");
+    assert!(body.contains("no session here"), "{body:?}");
+
+    // Itself. A session talking to itself is a loop with an extra step.
+    let (status, body) = post(&claude[0].send_url, &[("X-Marol-To", &a1.session_id)], "hi me");
+    assert!(status.contains("409"), "{status}");
+    assert!(body.contains("cannot message itself"), "{body:?}");
 }
 
 /* ------------------------------ WSL bridge ----------------------------- */
@@ -2183,7 +2625,7 @@ impl SshFixture {
                 }
                 let body = format!(
                     "#!/bin/bash\nif [ \"$1\" = \"--version\" ]; then echo \"2.1.226 (Claude Code)\"; exit 0; fi\n\
-                     printf '%s\\0' \"$PWD\" \"${{MAROL_NAME_URL:-}}\" \"$@\" > \"{logs}/${{MAROL_SESSION_ID:-unknown}}.$$\"\n\
+                     printf '%s\\0' \"$PWD\" \"${{MAROL_NAME_URL:-}}\" \"${{MAROL_PEERS_URL:-}}\" \"${{MAROL_SEND_URL:-}}\" \"$@\" > \"{logs}/${{MAROL_SESSION_ID:-unknown}}.$$\"\n\
                      exec cat > \"{logs}/stdin.${{MAROL_SESSION_ID:-unknown}}.$$\"\n",
                     logs = logs.display()
                 );

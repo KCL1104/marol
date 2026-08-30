@@ -86,7 +86,9 @@ export function WelcomeDialog({ boot, onReprobe, onNewTask, onNewSession, onClos
         <span className="stat-value mono">
           {boot.messaging
             ? '✓'
-            : t('env.messagingOff', { version: boot.claudeVersion ?? '—' })}
+            : boot.claude
+              ? t('env.messagingOld', { version: boot.claudeVersion ?? '—' })
+              : t('env.messagingNoClaude')}
         </span>
       </div>
 
