@@ -569,10 +569,25 @@ impl HostRef<'_> {
             // one is free. Declining is normal and costs nothing: the spawn
             // below is what this app did before there were channels at all.
             _ => {
-                if let Some(answer) = self.channels.and_then(|c| {
-                    c.run(self.host, self.local, self.env, program, args, cwd, extra)
-                }) {
-                    return Ok(as_output(answer));
+                match self
+                    .channels
+                    .map(|c| c.run(self.host, self.local, self.env, program, args, cwd, extra))
+                {
+                    Some(crate::channel::Outcome::Ran(answer)) => return Ok(as_output(answer)),
+                    // Sent, and then silence. Whether it ran is not knowable
+                    // from here, and the two ways of being wrong are not
+                    // equal: waiting again for a read costs a moment, while
+                    // repeating a commit or a merge costs the repository. So
+                    // this is raised rather than retried, and says which of
+                    // the two it is refusing to guess at.
+                    Some(crate::channel::Outcome::Lost(why)) => {
+                        return Err(anyhow!(
+                            "`{program}` was handed to a held shell in this world and no answer \
+                             came back ({why}). Whether it ran is unknown, so it has not been \
+                             run again — check the world before repeating it."
+                        ))
+                    }
+                    _ => {}
                 }
                 match self.host {
                     Host::Local => unreachable!("handled above"),

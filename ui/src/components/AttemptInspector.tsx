@@ -514,6 +514,19 @@ export function AttemptInspector({
         </div>
       )}
 
+      {/* How far this session stands from a person, once it is standing
+          anywhere at all. Shown from the first relay rather than only at the
+          ceiling, because the useful moment is watching it climb: a person
+          who can see three becoming five can step in before the desk has to
+          refuse anything on their behalf. Typing into the terminal is what
+          puts it back to zero, so the way to act on this is the terminal
+          already on screen — there is nothing to add here but the fact. */}
+      {(session?.relay_hops ?? 0) > 0 && (
+        <p className="muted small" data-testid="relay-depth">
+          {t('inspector.relayed', { n: String(session?.relay_hops ?? 0) })}
+        </p>
+      )}
+
       {/* A message is holding for the end of this turn. Visible where it
           was queued, with the one act that still applies: changing your
           mind before Stop spends it. */}

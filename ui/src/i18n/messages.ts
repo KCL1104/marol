@@ -376,6 +376,7 @@ export const en = {
   'inspector.shell': 'shell',
   'inspector.queued': 'A message will send when this turn ends',
   'inspector.queuedFrom': '{who} is waiting for this turn to end',
+  'inspector.relayed': '{n} relays since a person last said anything',
   'timeline.waited': '· held {for}',
 
   /* ----------------------------- review ------------------------------- */
@@ -414,6 +415,9 @@ export const en = {
     'Codex will not run a hook it has not been shown, so the first Codex session on this machine reports nothing until you answer /hooks in its terminal — and until then it is also not told how to message the other sessions, which its SessionStart hook is what carries. Marol passes the same hook definition every time, so it is asked once.',
   'note.codexIdle':
     'Codex has no idle-prompt event, so a finished Codex turn reads as idle rather than waiting on you. Marol does not invent the state Codex cannot report.',
+  'env.channels': 'Held shells',
+  'env.channelsRow': '{held} of {total} answered without a process',
+  'env.channelsLost': ' · {n} lost',
   'env.db': 'database',
   'env.version': 'this build',
   'env.degraded':
@@ -913,6 +917,7 @@ export const zhTW: Record<MessageKey, string> = {
   'inspector.shell': 'shell',
   'inspector.queued': '一則訊息會在這個回合結束後送出',
   'inspector.queuedFrom': '{who} 正在等這個回合結束',
+  'inspector.relayed': '距離上一次有人說話，已經轉了 {n} 手',
   'timeline.waited': '· 等候 {for}',
 
   /* ----------------------------- review ------------------------------- */
@@ -945,6 +950,9 @@ export const zhTW: Record<MessageKey, string> = {
     'Codex 不會執行沒給它看過的 hook，所以這台機器上第一個 Codex session 在你於它的終端機裡回答 /hooks 之前不會回報任何東西 —— 在那之前它也不會被告知怎麼跟其他 session 傳訊，那是它的 SessionStart hook 帶的。Marol 每次都送同一份 hook 定義，所以只會被問一次。',
   'note.codexIdle':
     'Codex 沒有 idle-prompt 事件，所以結束的 Codex 回合讀起來是「待命」而不是「等你」。Codex 回報不了的狀態，Marol 不會替它發明。',
+  'env.channels': '常駐 shell',
+  'env.channelsRow': '{total} 個命令裡有 {held} 個不必開行程',
+  'env.channelsLost': ' · {n} 個沒有回音',
   'env.db': '資料庫',
   'env.version': '目前版本',
   'env.degraded':

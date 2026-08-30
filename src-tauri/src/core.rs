@@ -162,6 +162,17 @@ pub struct SessionMeta {
     /// "you left a note here" and "two other agents are waiting on this one"
     /// are not the same fact and were rendered as the same sentence.
     pub pending_from: Vec<String>,
+    /// How far what this session was last told sits from the last thing a
+    /// person said, counted in agent-to-agent hops.
+    ///
+    /// Zero is a person: typing into the terminal sets it, and so does any
+    /// delivery that carried a message they wrote. Every relay adds one, so a
+    /// session told something by an agent that was itself told by an agent is
+    /// at two, and `MAX_RELAY_HOPS` is where the desk stops passing it on.
+    ///
+    /// Transient like the followup flag beside it — a chain does not survive
+    /// the app, because neither do the terminals it ran through.
+    pub relay_hops: u32,
     /// The `$MAROL_PORT` a run script was handed, when the app can
     /// reach it (local and WSL; an SSH host's port lives on the remote).
     /// Transient like the followup flag: the server dies with the PTY, and
@@ -385,6 +396,7 @@ impl SessionMeta {
             agent_session: true,
             has_followup: false,
             pending_from: Vec::new(),
+            relay_hops: 0,
             preview_port: None,
             usage: None,
             transcript_path: None,
@@ -1171,13 +1183,12 @@ impl HookHandler for Router {
         if session_id == to {
             return Err("a session cannot message itself".to_string());
         }
-        let (from, target_idle) = {
+        let (from, hops, target_idle) = {
             let sessions = self.sessions.lock().unwrap();
-            let from = sessions
+            let sender = sessions
                 .get(session_id)
-                .ok_or_else(|| "the sending session is not on this desk".to_string())?
-                .title
-                .clone();
+                .ok_or_else(|| "the sending session is not on this desk".to_string())?;
+            let (from, hops) = (sender.title.clone(), sender.relay_hops + 1);
             let target = sessions
                 .get(to)
                 .ok_or_else(|| format!("no session here with id {to}"))?;
@@ -1186,15 +1197,44 @@ impl HookHandler for Router {
             }
             (
                 from,
+                hops,
                 !matches!(target.status, Status::Running | Status::Starting),
             )
         };
+        // The brake. Refused before anything is queued or recorded, because a
+        // chain this long is not a message to hold for later — it is one that
+        // should not be sent at all, and saying so while the sender is still
+        // in its own turn is what lets it do something else instead.
+        if hops > MAX_RELAY_HOPS {
+            // Said on the card as well as to the sender. The agent will do
+            // something with the refusal, but what it does is its own turn's
+            // business; the person watching the board is the one who can
+            // actually end the deadlock, and they will not read the agent's
+            // transcript to find out that it wants them.
+            {
+                let mut sessions = self.sessions.lock().unwrap();
+                let to_title = sessions.get(to).map(|s| s.title.clone()).unwrap_or_default();
+                if let Some(sender) = sessions.get_mut(session_id) {
+                    sender.activity = Some(Activity {
+                        tool: "SendMessage".to_string(),
+                        detail: format!("→ {to_title}: held back, {hops} relays from a person"),
+                    });
+                    sender.activity_since = now_ms();
+                }
+            }
+            self.broadcast();
+            return Err(format!(
+                "this would be relay {hops} since a person last said anything, and this desk \
+                 stops at {MAX_RELAY_HOPS} — ask the person at the keyboard rather than \
+                 another agent. Anyone typing into either terminal clears the count."
+            ));
+        }
         let core = self
             .core
             .get()
             .and_then(|w| w.upgrade())
             .ok_or_else(|| "this desk is shutting down".to_string())?;
-        core.enqueue_followup(to, text, Some(from))
+        core.enqueue_followup(to, text, Some(from), hops)
             .map_err(|e| format!("{e:#}"))?;
 
         // What the sender is doing, said the way the board already says it.
@@ -1571,6 +1611,10 @@ pub struct WorldHold {
 struct Pending {
     text: String,
     from: Option<String>,
+    /// This message's distance from a person, in relays. A person's own
+    /// follow-up is zero; a peer's message is the sender's own distance plus
+    /// the hop it is making now.
+    hops: u32,
 }
 
 impl Pending {
@@ -1592,6 +1636,21 @@ impl Pending {
 /// — the alternative this replaced dropped the *older* message and told
 /// nobody.
 const MAX_PENDING: usize = 16;
+
+/// How many relays a message may cross before the desk stops passing it on.
+///
+/// `MAX_PENDING` bounds a queue and cannot bound this: two agents answering
+/// each other never put more than one message on either queue, so a pair
+/// could trade turns until the app closed and never reach a depth of two. The
+/// thing that runs away is the chain, and this is the chain's length.
+///
+/// Eight, because a real errand is short — ask, answer, follow up, answer is
+/// four — and because every hop is a whole agent turn somebody pays for. Past
+/// eight the more useful thing an agent can do is ask the person, and the
+/// refusal says exactly that. A person typing into either terminal puts the
+/// count back to zero, so the ceiling is on unattended chains, not on how
+/// long two agents may work together.
+const MAX_RELAY_HOPS: u32 = 8;
 
 struct HoldPlan {
     /// Which socket, and in which of the two shapes. Carries the desk and the
@@ -1918,6 +1977,24 @@ impl Core {
             .unwrap()
             .insert(h.clone(), Arc::clone(&he));
         Ok(he)
+    }
+
+    /// What each world's held shells have actually done, for the panel.
+    ///
+    /// Local is left out because it has no doorway to save a crossing of:
+    /// commands there are spawned natively and always were, so a row saying
+    /// "0 held" would read as a fault rather than as the absence of one.
+    ///
+    /// Only worlds that have been reached appear, which is the honest set:
+    /// a distro nobody has opened a card in has no shells and no story.
+    pub fn channel_tallies(&self) -> Vec<(String, crate::channel::Tally)> {
+        let hosts = self.hosts.lock().unwrap();
+        let mut rows: Vec<(String, crate::channel::Tally)> = hosts
+            .values()
+            .filter_map(|he| Some((host::label(&he.host)?, he.channels.tally())))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
     }
 
     /// Split a stored path and resolve its host in one motion — the shape
@@ -2465,6 +2542,7 @@ impl Core {
             agent_session: true,
             has_followup: false,
             pending_from: Vec::new(),
+            relay_hops: 0,
             preview_port: None,
             usage: None,
             transcript_path: None,
@@ -2637,6 +2715,7 @@ impl Core {
             agent_session: true,
             has_followup: false,
             pending_from: Vec::new(),
+            relay_hops: 0,
             preview_port: None,
             usage: None,
             transcript_path: None,
@@ -2986,6 +3065,7 @@ impl Core {
             agent_session: false,
             has_followup: false,
             pending_from: Vec::new(),
+            relay_hops: 0,
             // Reachable worlds only: local directly, WSL through mirrored
             // networking. An SSH host's port lives on the remote, and a
             // recorded port nobody can dial would put a preview button on
@@ -3122,6 +3202,7 @@ impl Core {
             agent_session: false,
             has_followup: false,
             pending_from: Vec::new(),
+            relay_hops: 0,
             preview_port: None,
             usage: None,
             transcript_path: None,
@@ -3990,7 +4071,7 @@ impl Core {
                 "`{agent}`'s input conventions have not been measured; copy the text in instead"
             ));
         }
-        self.write(session_id, &prompt::bracketed_followup(text))
+        self.write_inner(session_id, &prompt::bracketed_followup(text), false)
     }
 
     /// The repository's branches, recency first, for the base picker.
@@ -4023,7 +4104,7 @@ impl Core {
                 ));
             }
         }
-        self.enqueue_followup(session_id, text, None)
+        self.enqueue_followup(session_id, text, None, 0)
     }
 
     /// Put one message on a session's queue, from a person (`from` absent) or
@@ -4032,7 +4113,13 @@ impl Core {
     /// The refusal is the point of the cap: a caller that is told "full"
     /// can say so to whoever sent the message, which is exactly what the
     /// single slot could never do.
-    fn enqueue_followup(&self, session_id: &str, text: &str, from: Option<String>) -> Result<()> {
+    fn enqueue_followup(
+        &self,
+        session_id: &str,
+        text: &str,
+        from: Option<String>,
+        hops: u32,
+    ) -> Result<()> {
         {
             let mut queues = self.followups.lock().unwrap();
             let queue = queues.entry(session_id.to_string()).or_default();
@@ -4045,6 +4132,7 @@ impl Core {
             queue.push_back(Pending {
                 text: text.to_string(),
                 from,
+                hops,
             });
         }
         self.refresh_pending(session_id);
@@ -4082,6 +4170,20 @@ impl Core {
             eprintln!("[core] queued follow-up for {session_id} failed: {e:#}");
             self.refresh_pending(session_id);
             return;
+        }
+
+        // How far this session now stands from a person. A batch carrying
+        // anything a person wrote is zero — they are in this turn, and that
+        // is the supervision the ceiling asks for. Otherwise the deepest
+        // link in it, because a chain is as long as its longest strand and a
+        // brake that took the shortest would be talked past by pairing an
+        // old message with a fresh one.
+        if let Some(s) = self.sessions.lock().unwrap().get_mut(session_id) {
+            s.relay_hops = if pending.iter().any(|p| p.from.is_none()) {
+                0
+            } else {
+                pending.iter().map(|p| p.hops).max().unwrap_or(0)
+            };
         }
 
         // One row per message, each under its own author. A relayed message
@@ -4269,6 +4371,7 @@ impl Core {
             agent_session: true,
             has_followup: false,
             pending_from: Vec::new(),
+            relay_hops: 0,
             preview_port: None,
             usage: None,
             transcript_path: None,
@@ -4554,9 +4657,27 @@ impl Core {
     }
 
     /// Forward keystrokes to the terminal, verbatim.
+    ///
+    /// A person is at the other end of this, so it is also where a relay
+    /// chain ends: somebody typing here is the supervision `MAX_RELAY_HOPS`
+    /// exists to require, and the count goes back to zero. The lock is
+    /// already taken for `last_active_at`, so the reset costs a store.
     pub fn write(&self, id: &str, data: &str) -> Result<()> {
+        self.write_inner(id, data, true)
+    }
+
+    /// The same write, said to be somebody other than the person.
+    ///
+    /// Split from `write` for one reason: a queued message is delivered by
+    /// pasting it, and a paste that counted as typing would clear the very
+    /// chain it is a link in — every relay would report itself as a person
+    /// and the brake would never engage.
+    fn write_inner(&self, id: &str, data: &str, by_person: bool) -> Result<()> {
         if let Some(s) = self.sessions.lock().unwrap().get_mut(id) {
             s.last_active_at = now_ms();
+            if by_person {
+                s.relay_hops = 0;
+            }
         }
         self.ptys.write(id, data)
     }
@@ -6379,6 +6500,7 @@ mod tests {
             agent_session: true,
             has_followup: false,
             pending_from: Vec::new(),
+            relay_hops: 0,
             preview_port: None,
             usage: None,
             transcript_path: None,

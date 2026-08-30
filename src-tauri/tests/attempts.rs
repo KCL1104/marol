@@ -2006,6 +2006,104 @@ fn a_codex_session_can_message_a_claude_session_and_it_arrives_marked() {
     assert!(act.detail.starts_with("→ Fix login"), "{:?}", act.detail);
 }
 
+/// The brake on an unattended chain.
+///
+/// Two agents answering each other is the runaway `MAX_PENDING` cannot see:
+/// neither queue ever holds more than the one message, so a pair could trade
+/// turns until the app closed and never reach a depth of two. What runs away
+/// is the chain, and every link in it is a whole agent turn somebody pays
+/// for. So the count is the chain's length, and the way out of it is the
+/// person — which is both what the refusal says and what clears it.
+#[test]
+fn a_relay_chain_stops_where_a_person_would_have_to_be_asked() {
+    let h = Harness::new("relaycap");
+    let _guard = h.rt.enter();
+
+    let t1 = h.card("Fix login", "make it work");
+    let a1 = h.start(&t1, "claude");
+    let one = h.launches(&a1.session_id, 1);
+    let t2 = h.card("Port the tests", "port them");
+    let a2 = h.start(&t2, "codex");
+    let two = h.launches(&a2.session_id, 1);
+
+    // Eight relays, alternating. Each one is delivered before the next is
+    // sent, because it is the delivery that tells the receiver how far from a
+    // person it now stands.
+    let mut sender_is_one = true;
+    for hop in 1..=8 {
+        let (url, to) = if sender_is_one {
+            (&one[0].send_url, &a2.session_id)
+        } else {
+            (&two[0].send_url, &a1.session_id)
+        };
+        let text = format!("relay {hop}");
+        let (status, reply) = post(url, &[("X-Marol-To", to.as_str())], &text);
+        assert!(status.contains("200"), "hop {hop} was refused: {status} {reply}");
+        h.stdin_when(to, |s| s.contains(&text));
+        sender_is_one = !sender_is_one;
+    }
+
+    // The ninth is the one that would have run unattended, and it does not.
+    let ninth = post(
+        &one[0].send_url,
+        &[("X-Marol-To", a2.session_id.as_str())],
+        "relay 9",
+    );
+    assert!(ninth.0.contains("409"), "the ninth relay went through: {ninth:?}");
+    // A refusal an agent cannot act on is a dropped message with extra steps.
+    assert!(
+        ninth.1.contains("ask the person"),
+        "the refusal does not say what to do instead: {:?}",
+        ninth.1
+    );
+
+    // And the way out is the person. Typing into the terminal is the
+    // supervision the ceiling exists to require, so it clears the count —
+    // the ninth relay was never wrong, only unwatched.
+    h.core.write(&a1.session_id, "carry on\r").expect("type into the terminal");
+    let after = post(
+        &one[0].send_url,
+        &[("X-Marol-To", a2.session_id.as_str())],
+        "relay 9 again",
+    );
+    assert!(
+        after.0.contains("200"),
+        "a person spoke and the chain stayed shut: {after:?}"
+    );
+}
+
+/// The relay's own delivery must not read as a person, or the brake could
+/// never engage: each hop would clear the count it was supposed to raise.
+#[test]
+fn a_relayed_paste_does_not_pass_for_somebody_typing() {
+    let h = Harness::new("relaypaste");
+    let _guard = h.rt.enter();
+
+    let t1 = h.card("Fix login", "make it work");
+    let a1 = h.start(&t1, "claude");
+    let one = h.launches(&a1.session_id, 1);
+    let t2 = h.card("Port the tests", "port them");
+    let a2 = h.start(&t2, "codex");
+    let two = h.launches(&a2.session_id, 1);
+
+    let (status, reply) = post(
+        &one[0].send_url,
+        &[("X-Marol-To", a2.session_id.as_str())],
+        "one hop",
+    );
+    assert!(status.contains("200"), "send refused: {status} {reply}");
+    h.stdin_when(&a2.session_id, |s| s.contains("one hop"));
+
+    let depth = h
+        .core
+        .sessions()
+        .into_iter()
+        .find(|s| s.id == a2.session_id)
+        .expect("the receiving session")
+        .relay_hops;
+    assert_eq!(depth, 1, "the paste that delivered a relay counted as a person");
+}
+
 /// A person's own follow-up is still the person's. The queue carries both
 /// kinds now, and the row each one leaves has to say which it was.
 #[test]

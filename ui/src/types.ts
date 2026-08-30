@@ -165,6 +165,11 @@ export interface SessionMeta {
       only thing queued is the person's own note — "you left a note here" and
       "two other agents are waiting on this one" are different facts. */
   pending_from?: string[];
+  /** How far what this session was last told sits from the last thing a
+      person said, counted in agent-to-agent relays. Zero is a person —
+      typing into the terminal puts it back there. Transient, like the queue
+      it is counted from. */
+  relay_hops?: number;
   /** The $MAROL_PORT a run script was handed, when reachable from the
       app (local and WSL; an SSH host's port lives on the remote). Transient
       — the server dies with the PTY. */
@@ -239,6 +244,12 @@ export interface BootStatus {
   /** Whether this desk's claude sessions can name themselves and, with
       that, message each other across cards. */
   messaging?: boolean;
+  /** What each non-local world's held shells have done since the app
+      started: commands answered without starting a process, commands handed
+      back to be spawned the old way, and commands sent whose answer never
+      came. Declining is silent by design, so a world where the channel never
+      opens looks exactly like a working one until these say otherwise. */
+  channels?: { world: string; held: number; spawned: number; lost: number }[];
   db?: string;
   hookUrl?: string | null;
   /** The opening-prompt template on disk — the one text this desk adds to a

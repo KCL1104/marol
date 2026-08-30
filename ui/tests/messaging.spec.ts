@@ -44,6 +44,53 @@ test.describe('cross-session messaging surfaces', () => {
   });
 
   /**
+   * The held shells are worth a row precisely because declining is silent.
+   *
+   * A world with no `sh` on the far side, or a pool that is always
+   * contended, falls back to spawning every command — which is correct, and
+   * is also indistinguishable from the channel working, except that the
+   * window feels the way it did before any of this. The count is the only
+   * place that difference is visible, so it says both halves: how many
+   * answers cost no process, and out of how many.
+   */
+  test('the diagnostics say what the held shells actually saved', async ({ page }) => {
+    await page.addInitScript(installMock);
+    await page.addInitScript(() => {
+      const internals = (
+        window as unknown as {
+          __TAURI_INTERNALS__: { invoke: (c: string, a?: unknown) => Promise<unknown> };
+        }
+      ).__TAURI_INTERNALS__;
+      const original = internals.invoke.bind(internals);
+      internals.invoke = (cmd: string, args?: unknown) =>
+        cmd === 'boot_status'
+          ? original(cmd, args).then((b) => ({
+              ...(b as object),
+              channels: [
+                { world: 'wsl:Ubuntu', held: 118, spawned: 2, lost: 0 },
+                { world: 'ssh:build', held: 4, spawned: 1, lost: 3 },
+              ],
+            }))
+          : original(cmd, args);
+    });
+    await page.goto('/');
+    await expect(page.locator('.tab')).toHaveCount(1);
+
+    await page.locator('.sidebar-foot').click();
+    await page.getByTestId('sec-diagnostics').click();
+    const panel = page.locator('.modal');
+    // One row per world, named the way a card's badge names it.
+    await expect(panel).toContainText('wsl:Ubuntu');
+    await expect(panel).toContainText('120 個命令裡有 118 個不必開行程');
+    // A lost command is a command whose fate is unknown, which is a
+    // different fact from a slow one and is not folded into the ratio.
+    await expect(panel).toContainText('ssh:build');
+    await expect(panel).toContainText('3 個沒有回音');
+    // The world with none stays quiet: a clean channel has nothing to add.
+    await expect(panel).not.toContainText('118 個沒有回音');
+  });
+
+  /**
    * The diagnostics list both CLIs this desk knows how to drive, and for
    * each one the two facts that decide what a card can do: whether it is
    * installed, and whether the installed version reports status. Those are

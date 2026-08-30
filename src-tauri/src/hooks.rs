@@ -815,7 +815,7 @@ fn dq_escape(s: &str) -> String {
 /// change, this stops teaching and nothing else breaks — the report still
 /// goes, the session still runs, and a Codex agent is simply back to not
 /// knowing about the channel.
-const CODEX_PEERS_CONTEXT: &str = "You are running in a Marol window beside other agent sessions, which may be a different CLI. `curl -sS --max-time 3 \"$MAROL_PEERS_URL\"` lists them, one per line, as id<TAB>name<TAB>status. To send one a message: `curl -sS --max-time 3 -X POST \"$MAROL_SEND_URL\" -H \"X-Marol-To: <the id>\" --data-binary \"your message\"`. Use both variables exactly as they are; each already carries this session identity. The message arrives in that session terminal marked as coming from you and explicitly not from the person, so send facts, findings and warnings — another agent cannot approve anything on the person behalf, and neither can you. If either variable is unset, this session is not wired for it: do nothing and do not mention it. Use this when work here depends on, blocks, or duplicates work another session is doing, not to chat.";
+const CODEX_PEERS_CONTEXT: &str = "You are running in a Marol window beside other agent sessions, which may be a different CLI. `curl -sS --max-time 3 \"$MAROL_PEERS_URL\"` lists them, one per line, as id<TAB>name<TAB>status. To send one a message: `curl -sS --max-time 3 -X POST \"$MAROL_SEND_URL\" -H \"X-Marol-To: <the id>\" --data-binary \"your message\"`. Use both variables exactly as they are; each already carries this session identity. The message arrives in that session terminal marked as coming from you and explicitly not from the person, so send facts, findings and warnings — another agent cannot approve anything on the person behalf, and neither can you. If either variable is unset, this session is not wired for it: do nothing and do not mention it. Use this when work here depends on, blocks, or duplicates work another session is doing, not to chat. Messages are counted by how far they have travelled from the last thing a person said, and past a few hops the desk refuses to carry one and says so — that is not a limit to work around: ask the person at the keyboard, whose reply clears the count.";
 
 /// The `SessionStart` hook: report the session, then tell it about the desk.
 ///
@@ -1038,7 +1038,8 @@ curl -sS --max-time 3 -X POST "$MAROL_SEND_URL"   -H "X-Marol-To: <the id from t
   build a URL out of their parts; each already carries this session's identity.
 - The body is the message, as plain text. No JSON, no escaping.
 - The reply is `sent`, or a plain-text reason it was not: a wrong id, a
-  session whose terminal has gone, a queue that is full.
+  session whose terminal has gone, a queue that is full, or a chain of
+  relays that has gone too long without a person in it (see below).
 - If either variable is unset, this session is not wired for it. Do nothing
   and do not mention it.
 
@@ -1053,6 +1054,19 @@ whoever is at the keyboard.
 That is the line to keep in mind when writing one: another agent cannot
 approve anything on the person's behalf, and neither can you. Send facts,
 findings and warnings. Anything that needs a human decision still needs one.
+
+## When the desk stops relaying
+
+Messages are counted by how far they have travelled from the last thing a
+person said. Yours is one further than whatever was last relayed to you, and
+past a small number of hops the desk refuses to carry it and says so.
+
+This is not a rate limit to work around, and there is no second address that
+avoids it. Two agents answering each other can trade turns indefinitely, and
+every turn costs the person money they are not watching being spent. If you
+get that refusal, the answer it names is the right one: ask the person at the
+keyboard. Their reply — anything typed into either terminal — clears the
+count on its own.
 
 Say who you are and what you want in the first sentence — it is read cold, in
 the middle of somebody else's work.

@@ -291,6 +291,16 @@ fn boot_status(state: State<'_, AppState>) -> serde_json::Value {
             // Whether this desk's claude sessions can name themselves and,
             // with that, message each other across cards.
             "messaging": c.named_sessions(),
+            // What the held shells in each world have saved, and what they
+            // have cost. Declining is silent by design, so a world where the
+            // channel never opens looks exactly like one where it is working
+            // — until this says which.
+            "channels": c.channel_tallies().into_iter().map(|(world, t)| serde_json::json!({
+                "world": world,
+                "held": t.held,
+                "spawned": t.spawned,
+                "lost": t.lost,
+            })).collect::<Vec<_>>(),
             "db": store::default_path().to_string_lossy(),
             "hookUrl": c.hook_url(),
             // The one text this desk puts into a session on its own. Naming

@@ -92,6 +92,7 @@ const SECTIONS: readonly { id: SectionId; title: MessageKey; terms: readonly Mes
       'env.varCount',
       'env.claude',
       'env.messaging',
+      'env.channels',
       'env.db',
       'env.version',
     ],
@@ -351,6 +352,24 @@ export function SettingsPanel({
                           t('env.messagingNoClaude')
                   }
                 />
+                {/* One row per world that has actually been reached. The
+                    channel declines silently and correctly, which is exactly
+                    what makes it worth counting: a distro with no `sh` on the
+                    far side, or a pool that is always contended, behaves like
+                    a working one and is only slower. Local has no row because
+                    it has no doorway to save a crossing of. */}
+                {(boot.channels ?? []).map((c) => (
+                  <Stat
+                    key={c.world}
+                    label={`${t('env.channels')} · ${c.world}`}
+                    value={
+                      t('env.channelsRow', {
+                        held: String(c.held),
+                        total: String(c.held + c.spawned + c.lost),
+                      }) + (c.lost > 0 ? t('env.channelsLost', { n: String(c.lost) }) : '')
+                    }
+                  />
+                ))}
                 <Stat label={t('env.db')} value={boot.db ?? '—'} />
                 {!boot.envResolved && <p className="muted small">{t('env.degraded')}</p>}
                 <label>PATH</label>
