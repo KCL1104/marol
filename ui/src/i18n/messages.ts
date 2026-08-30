@@ -411,7 +411,7 @@ export const en = {
   'env.cliQuietUnmeasured':
     'Marol does not know how to read status out of {agent}. The session is real; the card simply cannot say what it is doing.',
   'note.codexTrust':
-    'Codex will not run a hook it has not been shown, so the first Codex session on this machine reports nothing until you answer /hooks in its terminal. Marol passes the same hook definition every time, so it is asked once.',
+    'Codex will not run a hook it has not been shown, so the first Codex session on this machine reports nothing until you answer /hooks in its terminal — and until then it is also not told how to message the other sessions, which its SessionStart hook is what carries. Marol passes the same hook definition every time, so it is asked once.',
   'note.codexIdle':
     'Codex has no idle-prompt event, so a finished Codex turn reads as idle rather than waiting on you. Marol does not invent the state Codex cannot report.',
   'env.db': 'database',
@@ -942,7 +942,7 @@ export const zhTW: Record<MessageKey, string> = {
   'env.cliQuietUnmeasured':
     'Marol 不知道怎麼從 {agent} 讀出狀態。session 是真的，只是卡片說不出它在做什麼。',
   'note.codexTrust':
-    'Codex 不會執行沒給它看過的 hook，所以這台機器上第一個 Codex session 在你於它的終端機裡回答 /hooks 之前不會回報任何東西。Marol 每次都送同一份 hook 定義，所以只會被問一次。',
+    'Codex 不會執行沒給它看過的 hook，所以這台機器上第一個 Codex session 在你於它的終端機裡回答 /hooks 之前不會回報任何東西 —— 在那之前它也不會被告知怎麼跟其他 session 傳訊，那是它的 SessionStart hook 帶的。Marol 每次都送同一份 hook 定義，所以只會被問一次。',
   'note.codexIdle':
     'Codex 沒有 idle-prompt 事件，所以結束的 Codex 回合讀起來是「待命」而不是「等你」。Codex 回報不了的狀態，Marol 不會替它發明。',
   'env.db': '資料庫',
