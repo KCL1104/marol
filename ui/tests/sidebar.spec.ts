@@ -299,8 +299,20 @@ test.describe('folding the sidebar', () => {
 
     // 開完 session,焦點就在那個終端機裡 —— 在裡面,Ctrl+B 是 readline
     // 的 backward-char,不是我們的。這一按必須什麼都不做。
-    await page.keyboard.press('ControlOrMeta+b');
+    //
+    // 這裡刻意寫死 Control 而不是 ControlOrMeta:被讓出去的那顆是 Ctrl,
+    // 每個平台都一樣,因為 readline 讀的是 Ctrl。在 mac 上 ControlOrMeta
+    // 會變成 ⌘,而 ⌘B 從來就不是 shell 的 —— 它該收側欄,底下那一按就是
+    // 在講這件事。
+    await page.keyboard.press('Control+b');
     await expect(page.getByTestId('session-s1')).toBeVisible();
+
+    // shell 沒在讀的修飾鍵,終端機裡外都是我們的。
+    await page.keyboard.press('Meta+b');
+    await expect(page.getByTestId('sidebar-unfold')).toBeVisible();
+    await page.getByTestId('sidebar-unfold').click();
+    await expect(page.getByTestId('session-s1')).toBeVisible();
+    await page.locator('.term-host').first().click();
 
     // 加 Shift 才是這個 app 的那一顆,與 E/L/F/I 同一條規則。
     await page.keyboard.press('ControlOrMeta+Shift+B');

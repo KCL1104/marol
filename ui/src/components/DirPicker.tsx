@@ -42,7 +42,24 @@ export function DirPicker({
   const [typed, setTyped] = useState(start ?? '');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  /** Which row the keyboard is on. -1 is the input, above the list. */
+  /**
+   * Which row the keyboard is on. -1 is the input, above the list.
+   *
+   * The keyboard's, and only the keyboard's. The pointer used to move it too,
+   * on the theory that hovering a row and pressing Enter should descend into
+   * it — but that made a mouse resting anywhere over the list silently change
+   * what Enter in the box means, and the box is where paths are typed. The
+   * hover highlight is drawn by `.dirpick-row:hover` in CSS, so nothing was
+   * lost by taking the pointer back out of this: the row still lights up
+   * under the mouse, it just no longer speaks for the keyboard.
+   *
+   * It mattered most where the pointer never moved at all. Clicking a row
+   * re-lists under a stationary mouse, and the browser then decides on its
+   * own schedule when to tell the page that a different row is under the
+   * pointer — a boundary event that on macOS could arrive after the typing
+   * and before the Enter, which is how a test that typed a bad path kept
+   * descending into a good one instead of reporting the typo.
+   */
   const [cursor, setCursor] = useState(-1);
   const listRef = useRef<HTMLDivElement>(null);
 
@@ -130,14 +147,8 @@ export function DirPicker({
           aria-label={t('pick.path')}
           onFocus={() => setCursor(-1)}
           // Typing is the keyboard saying where it is, and it belongs in the
-          // box. Without this the cursor keeps whatever a passing mouse left
-          // on it — `onMouseEnter` sets it too — and Enter descends into the
-          // row under the pointer instead of going to the path just typed.
-          //
-          // The focus handler above only looked like it covered this. It does
-          // where clicking a row moves focus to that row's button, which is
-          // what happens on Linux and Windows; on macOS a click leaves focus
-          // in the box, no focus event follows, and the stale cursor wins.
+          // box: whatever row the cursor was on, it is not where Enter should
+          // go once a path has been typed over it.
           onChange={(e) => {
             setTyped(e.target.value);
             setCursor(-1);
@@ -171,7 +182,6 @@ export function DirPicker({
             key={r.path}
             className={`dirpick-row${i === cursor ? ' on' : ''}${r.up ? ' up' : ''}`}
             data-testid={`dirpick-row-${r.name}`}
-            onMouseEnter={() => setCursor(i)}
             onClick={() => go(r.path)}
           >
             {r.name}
