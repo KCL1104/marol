@@ -515,6 +515,7 @@ be driven without the mouse. `⌘/Ctrl+/` shows this list in the app:
 | `⌘/Ctrl+←` `→` `↑` `↓` | Move the focused board card: a column sideways, a slot up or down |
 | `Ctrl+PgDn` `PgUp` | Next / previous tab |
 | `⌘/Ctrl+I` | Open or close the inspector |
+| `⌘/Ctrl+B` | Collapse the sidebar to a rail, and bring it back |
 | `⌘/Ctrl+,` | Settings |
 | `J` `K` | Walk the diff lines; `Enter` comments on one |
 | `N` `P` | Walk the diff files; on a file's header `e` opens it in the in-place editor, `v` marks it viewed |
@@ -525,6 +526,19 @@ Inside a terminal the app's shortcuts take Shift, so `Ctrl+Shift+E` rather
 than `Ctrl+E`, the same way `Ctrl+Shift+C` copies. `Ctrl+letter` there belongs
 to the shell.
 
+Collapsed, the sidebar leaves a rail rather than nothing. Two things survive
+the fold and only two: the way back, because a state you can only leave
+through a keyboard shortcut is a state people get stuck in, and the waiting
+count, because that is the number this desk exists to keep on screen. The rows
+themselves unmount, which is the point rather than a side effect — the
+once-a-second timer that drives their elapsed readouts goes with them.
+
+The shortcuts sheet also lists the keys that belong to the **agent** rather
+than to Marol, in a table of its own: Codex's `Ctrl+T` opens its own
+transcript, and its pager keys move around inside it. They are listed apart
+because Marol cannot change them, and folding them into the same table would
+say otherwise.
+
 A dialog holding typed text ignores backdrop clicks (Escape still closes it),
 and deleting a card takes two clicks, the second one naming what it is about
 to do.
@@ -533,6 +547,32 @@ Focus is handed, never dropped: the palette lands on the card it names;
 creating a card switches to the board with the new card focused and announced;
 merging from an empty terminal wall lands on the freshly judged card; and
 sending a review batch gives the caret back to the diff.
+
+### Scrolling a full-screen agent
+
+A wheel notch over a pane does one of three things, and the agent on screen
+decides which. On the normal buffer it scrolls the pane's own 10k scrollback
+and no bytes reach the program. Under mouse tracking it becomes a mouse report
+and the program scrolls itself. On the **alternate** buffer there is no
+scrollback to move, so xterm.js converts the wheel into cursor keys and lets
+the program do the scrolling — which is where every held agent lives, because
+`tmux` emits `smcup` the moment it attaches.
+
+The idea is right; xterm.js's arithmetic was not. It computes how many lines a
+notch is worth and then sends exactly one, and it damps pixel deltas under
+50px by 0.3 as "likely trackpad" before flooring them to whole cells — which,
+at a ~17px cell and the ~4px deltas a trackpad actually emits, means roughly
+thirteen events in fourteen send nothing at all. On a laptop that is not an
+edge case; it reads as a dead wheel.
+
+So the arithmetic is Marol's: sub-line deltas accumulate across events until
+they are worth a line, and a notch sends the lines it is worth. Two cases are
+handed straight back to xterm.js — a program that asked for wheel reports owns
+its own wheel, and the normal buffer has a real scrollback that the viewport
+should move. Nothing about `tmux` changes: `set -g mouse on` was considered and
+refused, because on the alternate screen `tmux`'s own binding forwards the
+event anyway, so it buys nothing and costs the promise that `tmux` never draws
+a cell.
 
 ### Screen readers
 
@@ -960,6 +1000,17 @@ Codex has no idle-prompt event, so it never reports "waiting on you". A state
 nothing can report is not a state this desk invents; a finished Codex turn is
 `idle`, which is already "your move".
 
+**A card that will never report says so.** The disclaimer used to be withheld
+from any CLI whose conventions are measured, on the grounds that it is
+expected to report and a chip that withdrew itself on the first hook would be
+a flicker. But being a CLI this desk knows how to wire is not being one it
+*did* wire: a Codex older than its own hooks engine runs perfectly and says
+nothing, and its card was indistinguishable from one working quietly. What is
+recorded at launch is whether the wiring actually happened — per session,
+because the answer is per world, and a distro's own binary may be new enough
+while this machine's is not. An unwired session never reports, so the chip
+still cannot flicker.
+
 Only "waiting on permission" and "waiting on you" raise a notification and
 count towards the badge. Those are the two states where the agent really is
 blocked and cannot continue without you.
@@ -978,7 +1029,7 @@ documented:
    means the same thing in `sh` and in `cmd.exe`, where `true` is not a
    command at all). The app breaking must never wedge the agent along with it.
 
-Three more, from measuring Codex 0.147:
+Four more, from measuring Codex 0.147 and reading its source:
 
 4. **Codex offers no `http` hook type**, so every event costs a `curl` — and
    its default hook timeout is ten minutes. A status ping that can hold a tool
@@ -987,12 +1038,22 @@ Three more, from measuring Codex 0.147:
 5. **A Codex hook does not run until it has been trusted**, and trust is
    recorded against the hook's own hash. So the definition is byte-identical
    for every session — the session id rides as `$MAROL_SESSION_ID` rather than
-   being baked in — and one `/hooks` covers a machine for good.
+   being baked in — and one `/hooks` covers a machine for good. It also gates
+   more than status now: `SessionStart` is what tells a Codex session how to
+   message the others, so until `/hooks` is answered it neither reports nor
+   knows about the channel.
 6. **A shell that does not spell variables with `$` leaves the id standing.**
    Every hook payload carries the working directory, and an attempt's worktree
    belongs to exactly one session, so a report whose id did not survive is
    placed by its directory instead. Two live sessions in one directory is
    refused rather than guessed at.
+7. **A `SessionStart` hook can hand Codex context, not just a report.**
+   Returning `hookSpecificOutput.additionalContext` on stdout has Codex record
+   it as a developer message on the conversation, which is the one per-launch
+   door Codex offers for teaching a session something. Read from Codex's own
+   source rather than measured through the binary, and said so where it is
+   used: if it changes, a Codex session is simply back to not knowing about
+   the channel, and nothing else breaks.
 
 (Three more measured findings, about worktrees and the first prompt, are under
 "Tasks and attempts" below.)
@@ -1110,7 +1171,8 @@ They are not translations of each other, and nothing here pretends they are:
 | unprompted | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` |
 | hooks | a plugin, via `--plugin-dir` | config, via `-c hooks.*` |
 | idle prompt | reported | no such event — a finished turn is `idle` |
-| session names | `--name`, and messaging with it | none |
+| session names | `--name`, and the CLI's own messaging with it | none |
+| messaging between cards | through Marol's own channel | the same channel |
 | token ledger | one row per message | a running total |
 
 Neither wiring writes into your own configuration. An app that injected
@@ -1129,6 +1191,76 @@ the repository itself carries.
 
 ---
 
+## Sessions that talk to each other
+
+Cards on one board are often working on the same code, and the thing one of
+them learns is frequently the thing another needs. Claude Code has a feature
+for exactly that, and Marol turns it on — `--name` gives each session the name
+its own row wears, so a message has somewhere to go. But it answers a smaller
+question than this desk asks. It is Claude Code's, so a Codex session can
+neither use it nor be addressed by it; and it is per machine, a socket under
+`/tmp` and a registry in `~/.claude`, while a desk routinely spans a WSL
+distro and an SSH host whose filesystems share neither.
+
+So there is a second channel, this desk's own, and either measured CLI can be
+on either end of it. Every wired session is handed two addresses of its own:
+
+```bash
+curl -sS --max-time 3 "$MAROL_PEERS_URL"       # id<TAB>name<TAB>status, one per line
+curl -sS --max-time 3 -X POST "$MAROL_SEND_URL" \
+  -H "X-Marol-To: <id>" --data-binary "auth.py is mine — do not touch it"
+```
+
+Out of a session is the status listener, which already crosses a WSL mount and
+an SSH tunnel. Into one is the same paste that delivers a person's own
+follow-up. Neither half is new; what was missing between them was a way to ask
+who is here, a way to say whom a message is for, and an identity worth
+trusting.
+
+**Addressed by id, not by name.** A name is a person's sentence and may hold a
+quote, a space, a newline; an id is a uuid. That one choice is why nothing in
+the channel needs escaping, percent-encoding or JSON — both variables are used
+exactly as they are, the id rides in a header, and the message is the body.
+
+**A token per session.** `sid` alone is a uuid a sibling could read out of its
+own environment, and this channel puts text into another agent rather than
+reporting about itself. Each wired session gets a token minted for that launch
+— never stored, and never on the session row the window is sent, which would
+be a token in the page. `$MAROL_NAME_URL` deliberately does not carry one: the
+worst a forged rename can do is retitle a row.
+
+**It arrives marked.** A follow-up a person typed carries a person's
+authority; a message relayed from another agent arrives through the same
+keyboard and must not. So it is wrapped in a frame that says it came from
+another session, which one, and that it does not stand in for the person —
+that last clause being the load-bearing one, because without it a peer could
+tell an agent running unattended under a permissive mode to do anything a user
+could. Another agent cannot approve anything on your behalf, and the message
+says so before the agent reads a word of it.
+
+**Delivery waits for the turn.** A message is queued rather than typed
+straight in, because the target may be mid-turn and a paste landing inside one
+steers it instead of answering it; a target that is not mid-turn has its queue
+flushed at once. The queue is bounded, and full is an answer rather than a
+silent drop — the sender is an agent that can act on being told so. Several
+messages become several paragraphs of one turn, never several turns.
+
+**The timeline says who spoke.** A relayed message is its own kind of row,
+naming the sender, and carries no restore anchor — a restore belongs to a turn
+the person started, and this is not one of those. Filing it as a prompt would
+have told whoever reads the record afterwards the same lie the frame exists to
+stop telling the agent.
+
+**Each CLI learns it through its own door.** Claude Code reads a skill out of
+the plugin `--plugin-dir` carries. Codex has no per-launch equivalent — its
+skills live in `~/.codex/skills`, the person's own configuration, which this
+app does not write into — so it is told by its own `SessionStart` hook, which
+may return `additionalContext` that Codex records on the conversation. Neither
+CLI has anything written into its config, and a Codex session can *receive*
+without being taught anything at all.
+
+---
+
 ## Architecture
 
 ```
@@ -1143,6 +1275,49 @@ Rust core  ── PTY registry · session list · SQLite
 The core (`src-tauri/src/core.rs`) does not depend on Tauri; it talks outwards
 only through the `UiSink` trait, so adding an axum websocket later to let a
 browser or a remote client connect would not mean rewriting it.
+
+### What a doorway costs
+
+Everything Marol does inside a WSL distro or on an SSH host used to be its own
+`wsl.exe` or `ssh`, and on Windows a process is the expensive part. That never
+showed locally, because locally the same calls are `std::fs` and cost
+microseconds — the app was three orders of magnitude apart on the two paths
+and looked identical in the source.
+
+Three things closed it, and the order matters: the first stopped the window
+freezing, the second and third made the work actually smaller.
+
+- **No command runs on the window's own thread.** A synchronous
+  `#[tauri::command]` runs its whole body on the main thread, and on Windows
+  the WebView2 handler that carries an invoke fires there too. So a card
+  refresh was 300ms in which the window did not repaint, input was not
+  processed, and terminal output could not reach the webview. The work goes to
+  a blocking pool now — deliberately not to the async runtime, which is where
+  the hook listener every agent reports to lives, and starving *that* would
+  turn a slow desk into a slow agent. `term_write` and `term_resize` stay
+  synchronous on purpose: a keystroke is a write to a pipe this process
+  already holds, and the blocking pool gives no ordering, so moving them could
+  deliver two quick keys reversed.
+- **A read costs a process per answer, not per question.** The board's
+  footprint was four git invocations plus one per untracked file, asked for
+  every open attempt every fifteen seconds; the Knows tab was six existence
+  checks, four listings, and one more check per skill. Those loops did not
+  disappear — `--no-index` against `/dev/null` is still what renders a new
+  file as the patch that would create it — they moved to the far side of the
+  door, into one script that prints its sections back.
+- **A world holds a shell open.** One `sh` per world, and every later command
+  is a line written to its stdin, so those reads cost no process at all. It is
+  an optimisation and never a dependency: a world that will not hold a shell,
+  a shell that died, a command too large for a pipe, or simply every channel
+  busy all fall back to spawning the command the old way. The frame counts
+  bytes rather than ending on a marker, because output is bytes and any
+  terminator would eventually appear inside a file being read.
+
+Locally none of the batching or the channels apply, for two reasons: there is
+no doorway to amortise, and `sh` is not on a Windows login-shell PATH. A test
+counts the crossings a real `wsl://` attempt makes and pins them at zero,
+because a bound would let a regression put one back per card per fifteen
+seconds and still pass.
 
 ### Why resolve the login-shell environment
 

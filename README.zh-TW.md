@@ -431,6 +431,7 @@ app 裡顯示這份清單：
 | `⌘/Ctrl+←` `→` `↑` `↓` | 搬動聚焦的卡片：左右換欄、上下換位 |
 | `Ctrl+PgDn` `PgUp` | 下一個 / 上一個分頁 |
 | `⌘/Ctrl+I` | 開關檢視器 |
+| `⌘/Ctrl+B` | 把側欄收成一條軌，再把它叫回來 |
 | `⌘/Ctrl+,` | 設定 |
 | `J` `K` | 在 diff 行之間移動；`Enter` 對該行留言 |
 | `N` `P` | 在 diff 檔案之間移動；停在檔頭時 `e` 就地展開編輯器、`v` 標該檔已看 |
@@ -440,12 +441,42 @@ app 裡顯示這份清單：
 在終端機裡，app 的快捷鍵要多按 Shift，也就是 `Ctrl+Shift+E` 而不是
 `Ctrl+E`，就像 `Ctrl+Shift+C` 是複製一樣。那裡的 `Ctrl+字母` 屬於 shell。
 
+收起來之後，側欄留下的是一條軌而不是什麼都沒有。只有兩樣東西活過這次摺疊：
+回去的路，因為一個只能用快捷鍵離開的狀態會把人關在裡面；還有「幾個在等你」，
+因為那是這張桌子存在的理由。列本身是真的卸載掉的 —— 那是重點不是副作用，
+驅動它們計秒的那個一秒一次的計時器也跟著走。
+
+快捷鍵表另外用一張表列出屬於 **agent** 而不屬於 Marol 的鍵：Codex 的
+`Ctrl+T` 打開它自己的 transcript，pager 鍵在裡面移動。分開列是因為 Marol
+改不動它們，混在同一張表裡等於宣稱改得動。
+
 已輸入文字的對話框會忽略誤點 backdrop（Escape 仍然關得掉）；刪除卡片要按
 兩下，第二下會用文字說明它要做什麼。
 
 焦點用交的，不用丟的：命令面板落在它點名的那張卡上；開新卡會切到看板、聚焦
 新卡並唸出來；從空的終端機牆合併，焦點落在剛裁決完的卡片上；送出 review
 批次之後，游標交還給 diff。
+
+### 捲動一個整頁的 agent
+
+滑鼠滾一格會發生什麼，由畫面上那個 agent 決定，只有三種。在 normal buffer
+上它捲動這個 pane 自己的 10k scrollback，一個 byte 都不會送給程式。開了
+mouse tracking 就變成一則 mouse report，由程式自己捲。在 **alternate**
+buffer 上沒有 scrollback 可捲，所以 xterm.js 把滾輪轉成方向鍵、讓程式自己
+處理 —— 而每一個被 tmux 握住的 agent 都住在那裡，因為 tmux 一 attach 就送
+`smcup`。
+
+想法是對的，xterm.js 的算術不對。它算出一格值幾行，然後只送一行；而且把小於
+50px 的 pixel delta 當「大概是觸控板」乘以 0.3 再向下取整到整格 —— 以 ~17px
+的 cell 配觸控板實際送出的 ~4px delta 計算，十四次裡大約十三次什麼都不送。
+在筆電上這不是邊緣情況，感覺就是滾輪壞了。
+
+所以算術改成 Marol 自己的：不足一行的 delta 跨事件累積，直到夠一行為止；一格
+送它該送的行數。兩種情況原封交還給 xterm.js —— 自己要了 wheel report 的程式
+擁有自己的滾輪，而 normal buffer 有真的 scrollback，該動的是 viewport。tmux
+那邊什麼都沒改：`set -g mouse on` 評估過後否決，因為在 alternate screen 上
+tmux 自己的綁定本來就是轉發，買不到東西，卻要賠掉「tmux 永不畫任何一格」
+這個承諾。
 
 ### 螢幕閱讀器
 
@@ -795,6 +826,14 @@ Codex 沒有閒置提示事件，所以它從不回報「等你回覆」。沒�
 的狀態，這張桌子不會自己發明；Codex 回合結束就是「待命」，那本來就是
 「該你了」。
 
+**一張永遠不會回報的卡片會自己說出來。** 這個免責標籤原本對任何慣例已被實測
+的 CLI 一律不顯示，理由是它本來就該回報，而一個在第一個 hook 到達時就自己收
+回去的標籤是閃爍。但「這張桌子知道怎麼接這支 CLI」不等於「它真的接上了」：
+一個比自己 hooks engine 還舊的 Codex 跑得好好的、一句話都不說，而它的卡片跟
+一張安靜工作中的卡片長得一模一樣。現在記在啟動當下的是「接線到底有沒有發生」
+—— 而且是每個 session 各自記，因為答案是每個世界各自的，distro 裡那支可能夠新
+而本機那支不夠。沒接上的 session 永遠不會回報，所以標籤依然不可能閃爍。
+
 只有「等你授權」與「等你回覆」會發通知與計入徽章。那是 agent 真的被擋住、
 沒有你就無法繼續的兩種狀態。
 
@@ -809,7 +848,7 @@ Codex 沒有閒置提示事件，所以它從不回報「等你回覆」。沒�
    `cmd.exe` 裡意思一樣，而 `cmd.exe` 根本沒有 `true` 這個命令）。app 掛掉
    絕不能連帶卡死 agent。
 
-再三個，量的是 Codex 0.147：
+再四個，量的是 Codex 0.147，外加讀它的原始碼：
 
 4. **Codex 沒有 `http` 這種 hook type**，所以每個事件都要付一次 `curl` ——
    而它預設的 hook timeout 是十分鐘。一個能把工具呼叫卡住十分鐘的狀態回報，
@@ -817,10 +856,18 @@ Codex 沒有閒置提示事件，所以它從不回報「等你回覆」。沒�
    `curl` 還更早放棄。
 5. **Codex 的 hook 沒被信任過就不會跑**，而信任是記在 hook 自己的雜湊上。
    所以這份定義每個 session 都一模一樣 —— session id 走 `$MAROL_SESSION_ID`
-   而不是寫死 —— 一次 `/hooks` 就管一台機器一輩子。
+   而不是寫死 —— 一次 `/hooks` 就管一台機器一輩子。它現在擋住的不只是狀態：
+   `SessionStart` 正是告訴 Codex session 怎麼跟其他 session 傳訊的那個 hook，
+   所以在 `/hooks` 被回答之前，它既不回報、也不知道有這條通道。
 6. **不用 `$` 拼變數的 shell 會讓那個 id 原樣留著。** 每份 hook payload 都帶
    工作目錄，而一個 attempt 的 worktree 只屬於一個 session，所以 id 沒活著
    抵達的回報改用目錄安放。同一個目錄下有兩個活著的 session 就拒絕，不猜。
+7. **`SessionStart` hook 可以遞給 Codex 一段 context，不只是一則回報。**
+   在 stdout 回傳 `hookSpecificOutput.additionalContext`，Codex 會把它記成
+   對話上的一則 developer message —— 那是 Codex 唯一提供的、每次啟動都能教
+   session 一件事的門。這一條是讀 Codex 原始碼來的，不是從 binary 量出來的，
+   而且在用到它的地方就這麼寫著：萬一它變了，Codex session 只是回到不知道有
+   這條通道，其他什麼都不會壞。
 
 （另外三個關於 worktree 與首則 prompt 的實測結果，見下面「任務與 attempt」。）
 
@@ -917,7 +964,8 @@ Claude Code 與 Codex 是這張桌子知道其慣例的兩支 CLI，它們拿到
 | 全自動 | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` |
 | hooks | plugin，走 `--plugin-dir` | 設定，走 `-c hooks.*` |
 | 閒置提示 | 會回報 | 沒有這個事件 —— 回合結束就是「該你了」 |
-| session 名字 | `--name`，並以此互傳訊息 | 沒有 |
+| session 名字 | `--name`，CLI 自己也以此互傳訊息 | 沒有 |
+| 卡片之間傳訊 | 走 Marol 自己的通道 | 同一條通道 |
 | token 記帳 | 一則訊息一列 | 累計總和 |
 
 兩種接法都不寫進你自己的設定檔。一個會把自己塞進
@@ -934,6 +982,63 @@ Claude Code 與 Codex 是這張桌子知道其慣例的兩支 CLI，它們拿到
 
 ---
 
+## 會互相說話的 session
+
+同一張看板上的卡片常常在動同一份程式碼，而其中一張學到的事，往往正是另一張
+需要的。Claude Code 有一個功能就是做這件事，Marol 也把它打開了 —— `--name`
+讓每個 session 帶著它自己那一列的名字，訊息才有地方去。但它回答的問題比這張
+桌子問的小。那是 Claude Code 的東西，所以 Codex session 既不能用它、也不能被
+它定址；而且它是 per machine 的，一個 `/tmp` 底下的 socket 加一份
+`~/.claude` 裡的註冊表，而一張桌子動不動就橫跨 WSL distro 和 SSH host，
+兩邊的檔案系統一樣都不共用。
+
+所以有第二條通道，是這張桌子自己的，兩支實測過的 CLI 都可以站在任一端。每個
+接上了的 session 都拿到兩個屬於自己的位址：
+
+```bash
+curl -sS --max-time 3 "$MAROL_PEERS_URL"       # id<TAB>名字<TAB>狀態，一行一個
+curl -sS --max-time 3 -X POST "$MAROL_SEND_URL" \
+  -H "X-Marol-To: <id>" --data-binary "auth.py 我在動，先別碰"
+```
+
+出去走的是狀態 listener，它本來就跨得過 WSL 掛載和 SSH 隧道；進來走的是遞送
+人自己那則追加訊息的同一次貼上。兩半都不是新的；缺的是「怎麼問誰在這裡」、
+「怎麼說這則要給誰」，以及一個值得信任的身分。
+
+**用 id 定址，不用名字。** 名字是人寫的句子，可能有引號、空白、換行；id 是
+uuid。這一個選擇就是為什麼整條通道不需要任何 escaping、percent-encoding 或
+JSON —— 兩個變數照原樣用，id 走 header，訊息就是 body。
+
+**每個 session 一個 token。** 光靠 `sid` 是一個兄弟 session 從自己環境裡就讀
+得到的 uuid，而這條通道是把文字放進另一個 agent，不是回報自己。每個接上的
+session 拿到一個為那次啟動鑄的 token —— 不落地，也不放在送進視窗的 session
+列上，那等於把 token 放進網頁裡。`$MAROL_NAME_URL` 刻意不帶 token：偽造一次
+改名，最壞也只是換掉一個列名。
+
+**它抵達時戴著標記。** 人打的追加訊息帶著人的權限；從另一個 agent 中繼來的
+訊息走同一個鍵盤進來，就不能帶。所以它被包在一個框裡，說明它來自另一個
+session、是哪一個、以及它不代表那個人 —— 最後那句是承重的，因為沒有它，一個
+peer 就能叫一個在寬鬆模式下無人值守的 agent 做任何使用者能做的事。另一個
+agent 不能替你批准任何東西，而這句話在 agent 讀到內容之前就先說了。
+
+**遞送等回合結束。** 訊息是排隊而不是直接打進去，因為對方可能正在回合中間，
+而落在回合中間的貼上會去操縱它而不是回答它；不在回合中間的對象則立刻排空。
+佇列有上限，而且滿了是一個答案不是無聲丟棄 —— 寄件者是一個能對「滿了」做出
+反應的 agent。好幾則訊息會變成一個回合裡的好幾段，絕不會變成好幾個回合。
+
+**時間線說是誰講的。** 中繼來的訊息是自己一種列，指名寄件者，而且不帶還原
+錨點 —— 還原屬於人開始的回合，這不是其中之一。把它記成 prompt，等於對事後
+讀紀錄的人說了那個框正在阻止對 agent 說的同一個謊。
+
+**每支 CLI 走自己那扇門學會它。** Claude Code 從 `--plugin-dir` 帶進去的
+plugin 裡讀一份 skill。Codex 沒有等價的 per-launch 機制 —— 它的 skill 住在
+`~/.codex/skills`，那是人自己的設定，這個 app 不寫進去 —— 所以它由自己的
+`SessionStart` hook 告知，那個 hook 可以回傳 `additionalContext`，Codex 會把
+它記在對話上。兩支 CLI 的設定檔都沒有被寫進任何東西，而 Codex session 不用被
+教任何事就已經能**收**訊。
+
+---
+
 ## 架構
 
 ```
@@ -947,6 +1052,40 @@ Rust 核心  ── PTY registry · session 清單 · SQLite
 
 核心（`src-tauri/src/core.rs`）不依賴 Tauri，只透過 `UiSink` trait 對外，
 之後要加 axum websocket 讓瀏覽器或遠端連進來不必重寫。
+
+### 一扇門的代價
+
+Marol 在 WSL distro 裡或 SSH host 上做的每一件事，本來都是它自己的一個
+`wsl.exe` 或 `ssh`，而在 Windows 上，process 才是貴的那一部分。這件事在本機
+永遠看不出來，因為本機的同一批呼叫是 `std::fs`，成本是微秒級 —— 兩條路差了三
+個數量級，在原始碼裡看起來卻一模一樣。
+
+三件事把它關掉，而順序有意義：第一件讓視窗不再凍住，第二和第三件才真的把工作
+變少。
+
+- **沒有任何 command 跑在視窗自己的執行緒上。** 同步的
+  `#[tauri::command]` 會把整個函式主體跑在主執行緒上，而在 Windows 上，帶著
+  invoke 的那個 WebView2 handler 也在那裡觸發。所以一次卡片刷新就是 300 毫秒
+  的視窗不重繪、輸入不處理、終端機輸出也送不進 webview。現在那些工作交給一個
+  blocking pool —— 刻意不是交給 async runtime，因為每個 agent 回報狀態的那個
+  hook listener 就住在上面，餓死**它**會把一張慢的桌子變成一個慢的 agent。
+  `term_write` 和 `term_resize` 刻意保持同步：一次按鍵是往這個行程已經握著的
+  pipe 寫一次，而 blocking pool 之間沒有順序保證，搬過去可能讓兩個快速按鍵倒
+  序抵達。
+- **一次讀取付一個 process 給答案，不是給問題。** 看板的 footprint 本來是四次
+  git 呼叫加上每個未追蹤檔案一次，而且每張開著的卡每十五秒問一次；規則檔分頁
+  本來是六次存在檢查、四次列目錄、再加每個 skill 一次檢查。那些迴圈沒有消失
+  —— 對 `/dev/null` 做 `--no-index` 仍然是把新檔案畫成「會建立它的那個 patch」
+  的方法 —— 它們搬到門的另一邊，變成一份會把各段印回來的腳本。
+- **一個世界握著一個 shell。** 每個世界一個 `sh`，之後每個指令都是往它的 stdin
+  寫一行，所以那些讀取一個 process 都不用付。它是最佳化，絕不是依賴：撐不起
+  shell 的世界、死掉的 shell、大到不該塞進 pipe 的指令，或單純只是每條通道都
+  忙著，全都退回用舊方式生一個 process。框架數位元組而不是用結束標記，因為輸出
+  是 bytes，而任何終止符遲早會出現在某個被讀取的檔案裡。
+
+本機完全不套用批次也沒有通道，理由有兩個：沒有門要攤提，而且 `sh` 不在 Windows
+的 login-shell PATH 上。有一條測試會數一個真的 `wsl://` attempt 過了幾次門，
+並把它釘在零 —— 因為用上限會讓一個「每張卡每十五秒多一次」的回歸照樣通過。
 
 ### 為什麼要 login-shell 環境解析
 
