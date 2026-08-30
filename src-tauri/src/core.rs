@@ -8,7 +8,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1205,12 +1205,18 @@ pub struct Core {
     /// button is idempotent and the shells never pile up. In-memory only:
     /// a shell does not outlive the app any more than the PTYs do.
     shells: Mutex<HashMap<String, String>>,
-    /// One message per session, held for the end of its turn. Typing into
-    /// a running claude steers the turn in flight; this is the other thing
-    /// a person means — "when you are done, then this". Latest wins, and
-    /// like the shells it is transient: the turn it waits on cannot
-    /// outlive the app either.
-    followups: Mutex<HashMap<String, String>>,
+    /// Messages held for the end of a session's turn. Typing into a running
+    /// claude steers the turn in flight; this is the other thing a person
+    /// means — "when you are done, then this". Like the shells it is
+    /// transient: the turn it waits on cannot outlive the app either.
+    ///
+    /// A queue rather than the single slot it used to be. One slot was right
+    /// while the only sender was the person in front of it, where a second
+    /// message plainly supersedes the first. It stops being right the moment
+    /// another *session* can send one: two peers writing to the same agent
+    /// would have had the second silently evict the first, with neither
+    /// sender told and no trace that a message ever existed.
+    followups: Mutex<HashMap<String, VecDeque<Pending>>>,
     /// Everything known about each execution environment, resolved on first
     /// use and kept: a WSL distro's login environment costs a probe, and the
     /// answer does not change under a running app.
@@ -1418,6 +1424,38 @@ pub struct WorldHold {
 /// Three strings rather than a command, because the command has to be built
 /// twice — once to start or reattach, once to end — and both have to go
 /// through the world's doorway on the way out.
+/// One message waiting for a session's turn to end.
+///
+/// `from` is the whole difference between a person's follow-up and a peer's
+/// message: absent means the human typed it and it carries their authority,
+/// present means another session sent it and `prompt::peer_envelope` has to
+/// say so before it goes in.
+#[derive(Debug, Clone)]
+struct Pending {
+    text: String,
+    from: Option<String>,
+}
+
+impl Pending {
+    /// What actually goes into the terminal for this one.
+    fn rendered(&self) -> String {
+        match &self.from {
+            Some(from) => crate::prompt::peer_envelope(from, &self.text),
+            None => self.text.clone(),
+        }
+    }
+}
+
+/// How many messages may wait on one session before the desk starts refusing
+/// them.
+///
+/// A bound rather than a preference: the queue is drained by a turn ending,
+/// and a session that never ends a turn would otherwise collect messages for
+/// as long as the app runs. Refusing loudly at a limit is the honest failure
+/// — the alternative this replaced dropped the *older* message and told
+/// nobody.
+const MAX_PENDING: usize = 16;
+
 struct HoldPlan {
     /// Which socket, and in which of the two shapes. Carries the desk and the
     /// session, so two installs cannot collect each other's.
@@ -3786,10 +3824,30 @@ impl Core {
                 ));
             }
         }
-        self.followups
-            .lock()
-            .unwrap()
-            .insert(session_id.to_string(), text.to_string());
+        self.enqueue_followup(session_id, text, None)
+    }
+
+    /// Put one message on a session's queue, from a person (`from` absent) or
+    /// from another session (`from` naming it).
+    ///
+    /// The refusal is the point of the cap: a caller that is told "full"
+    /// can say so to whoever sent the message, which is exactly what the
+    /// single slot could never do.
+    fn enqueue_followup(&self, session_id: &str, text: &str, from: Option<String>) -> Result<()> {
+        {
+            let mut queues = self.followups.lock().unwrap();
+            let queue = queues.entry(session_id.to_string()).or_default();
+            if queue.len() >= MAX_PENDING {
+                return Err(anyhow!(
+                    "{} already has {MAX_PENDING} messages waiting for its turn to end",
+                    session_id
+                ));
+            }
+            queue.push_back(Pending {
+                text: text.to_string(),
+                from,
+            });
+        }
         self.set_followup_flag(session_id, true);
         Ok(())
     }
@@ -3803,9 +3861,20 @@ impl Core {
     /// goes in as the next one — through the same paste a live follow-up
     /// uses, recorded on the timeline the same way.
     pub(crate) fn flush_followup(&self, session_id: &str) {
-        let Some(text) = self.followups.lock().unwrap().remove(session_id) else {
-            return;
+        let pending: Vec<Pending> = match self.followups.lock().unwrap().remove(session_id) {
+            Some(q) if !q.is_empty() => q.into(),
+            _ => return,
         };
+        // Coalesced into one delivery rather than sent one after another.
+        // Each send is a paste followed by a return, so a second one would
+        // land in the middle of the turn the first just started — the exact
+        // interleaving the end-of-turn queue exists to avoid. Several
+        // messages become several paragraphs of one turn.
+        let text = pending
+            .iter()
+            .map(Pending::rendered)
+            .collect::<Vec<_>>()
+            .join("\n\n");
         if let Err(e) = self.send_followup(session_id, &text) {
             // The session died between queue and Stop. The message is
             // dropped rather than retried into a terminal that is gone.

@@ -1640,6 +1640,81 @@ fn a_followup_to_an_unmeasured_cli_is_refused_rather_than_guessed() {
     assert_eq!(rows.len(), 1, "a refused send still reached the timeline: {rows:?}");
 }
 
+/// The queue is a queue now, and that is what a second sender needs.
+///
+/// It used to be one slot per session: a second message overwrote the first,
+/// with neither sender told and no trace the older one ever existed. Fine
+/// while the only sender was the person in front of it; not fine the moment
+/// another session can send one.
+#[test]
+fn several_queued_messages_all_arrive_and_keep_their_order() {
+    let h = Harness::new("fuqueue");
+    let _guard = h.rt.enter();
+    let task = h.card("Fix login", "make it work");
+    let a = h.start(&task, "claude");
+    h.launches(&a.session_id, 1);
+
+    h.core.queue_followup(&a.session_id, "first thing").expect("queue 1");
+    h.core.queue_followup(&a.session_id, "second thing").expect("queue 2");
+    assert!(h.core.sessions().iter().any(|s| s.id == a.session_id && s.has_followup));
+
+    // The turn ends: Stop is what drains the queue.
+    h.hook(&a.session_id, "idle", serde_json::json!({}));
+
+    let stdin = h.stdin_when(&a.session_id, |s| s.contains("second thing"));
+    let first = stdin.find("first thing").expect("the older message was dropped");
+    let second = stdin.find("second thing").expect("the newer message was dropped");
+    assert!(first < second, "the queue did not keep its order: {stdin:?}");
+    // Coalesced into ONE turn: a second paste would land inside the turn the
+    // first just started, which is the interleaving the queue exists to stop.
+    assert_eq!(
+        stdin.matches("\u{1b}[200~").count(),
+        1,
+        "the queue was delivered as more than one turn: {stdin:?}"
+    );
+
+    // Drained, so the row stops advertising a message that already went.
+    let settled = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < settled {
+        if h.core.sessions().iter().any(|s| s.id == a.session_id && !s.has_followup) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("the follow-up flag survived the flush");
+}
+
+/// The bound exists so a session that never ends a turn cannot collect
+/// messages for as long as the app runs — and the refusal is the feature:
+/// a caller told "full" can say so to whoever sent it, which the single slot
+/// could never do.
+#[test]
+fn a_full_queue_refuses_rather_than_dropping_the_oldest() {
+    let h = Harness::new("fufull");
+    let _guard = h.rt.enter();
+    let task = h.card("Fix login", "make it work");
+    let a = h.start(&task, "claude");
+    h.launches(&a.session_id, 1);
+
+    for i in 0..16 {
+        h.core
+            .queue_followup(&a.session_id, &format!("message {i}"))
+            .unwrap_or_else(|e| panic!("message {i} should have fitted: {e}"));
+    }
+    let err = h
+        .core
+        .queue_followup(&a.session_id, "one too many")
+        .expect_err("the seventeenth should not have fitted");
+    assert!(err.to_string().contains("16"), "the refusal hides the limit: {err}");
+
+    // And the one that was refused is the one that is missing — the first is
+    // still there, which is the whole point of refusing at the back.
+    h.hook(&a.session_id, "idle", serde_json::json!({}));
+    let stdin = h.stdin_when(&a.session_id, |s| s.contains("message 15"));
+    assert!(stdin.contains("message 0"), "the oldest was evicted after all: {stdin:?}");
+    assert!(!stdin.contains("one too many"), "a refused message was sent: {stdin:?}");
+}
+
 #[test]
 fn an_empty_followup_is_not_sent() {
     let h = Harness::new("fuempty");
