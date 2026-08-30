@@ -135,6 +135,104 @@ fn path_hash(p: &str) -> String {
     format!("{hash:08x}")[..8].to_string()
 }
 
+/// The record separator these batched scripts put between their sections.
+///
+/// U+001E on a line of its own: it is the ASCII character whose entire job is
+/// this, and no git output contains it — a marker made of printable text
+/// would eventually appear inside a diff and split it in half.
+const SEP: &str = "\u{1e}";
+
+/// Run one script inside the host and hand back its sections.
+///
+/// The shape every batched read here takes: a shell script that runs several
+/// commands in the world the repository lives in and prints a separator
+/// between them, so what used to cost one process per question costs one
+/// process per *answer*. The count is checked rather than assumed — a script
+/// that died half way through would otherwise hand back a short list and let
+/// the caller read section two as though it were section three.
+fn sh_sections(
+    hr: &HostRef,
+    cwd: &str,
+    script: &str,
+    args: &[&str],
+    want: usize,
+    doing: &str,
+) -> Result<Vec<String>> {
+    debug_assert!(
+        !matches!(hr.host, Host::Local),
+        "the batched scripts are for crossings; locally there is no doorway and no `sh` \
+         to rely on — see `batching_is_for_doorways_only`"
+    );
+    let mut argv: Vec<&str> = vec!["-c", script, "_"];
+    argv.extend(args.iter().copied());
+    let out = hr
+        .run("sh", &argv, Some(cwd))
+        .with_context(|| format!("{doing} in {cwd}"))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "{doing} in {cwd} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    // Split on the character alone, not on a newline-wrapped marker: a
+    // section that produced nothing at all leaves the separator flush against
+    // the start of the output, where a `\n<SEP>\n` pattern would not match
+    // and every later section would be read as the wrong one. The stray
+    // newlines that survive are line noise to every caller here, all of which
+    // read their section a line at a time.
+    let sections: Vec<String> = text.split(SEP).map(str::to_string).collect();
+    if sections.len() != want {
+        return Err(anyhow!(
+            "{doing} in {cwd} answered with {} sections, not {want}",
+            sections.len()
+        ));
+    }
+    Ok(sections)
+}
+
+/// Everything `stat` needs, in the order `stat` reads it.
+///
+/// `$1` is the base commit, `$2` the base branch. Each section that used to
+/// be a `git()?` still fails loudly, with an exit code of its own so the
+/// error says which question went wrong rather than only that something did.
+/// The untracked loop stays best-effort, exactly as the per-file call it
+/// replaces was.
+///
+/// Filenames are read a line at a time, which is the same thing the code this
+/// replaces did with `untracked.lines()` — a newline in a filename was
+/// already outside what this counts, and moving the loop across the doorway
+/// does not make it worse.
+const STAT_SCRIPT: &str = r#"git diff --numstat "$1" || exit 11
+printf '\036\n'
+git ls-files --others --exclude-standard | while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  git diff --no-index --numstat -- /dev/null "$f" || true
+done
+printf '\036\n'
+git rev-list --left-right --count "$2...HEAD" || exit 13
+printf '\036\n'
+git status --porcelain || exit 14
+"#;
+
+/// The rendered diff, tracked then untracked, in one crossing.
+///
+/// `$1` is the base commit and `$2…` the `--src-prefix`/`--dst-prefix` pair a
+/// multi-repo workspace needs — shifted off so the loop can pass them on with
+/// `"$@"`.
+///
+/// `--no-index` against /dev/null renders a new file as the patch that would
+/// create it, so it reads like the rest of the diff; it exits 1 whenever
+/// there is a difference, which there always is, hence `|| true`.
+const DIFF_SCRIPT: &str = r#"base="$1"; shift
+git diff "$@" "$base" || exit 11
+printf '\036\n'
+git ls-files --others --exclude-standard | while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  git diff "$@" --no-index -- /dev/null "$f" || true
+done
+"#;
+
 fn git(hr: &HostRef, cwd: &str, args: &[&str]) -> Result<String> {
     let out = hr
         .run("git", args, Some(cwd))
@@ -641,27 +739,51 @@ impl Worktrees {
     /// empty, and the result is the repository-relative diff this has always
     /// produced.
     pub fn diff(&self, hr: &HostRef, worktree: &str, base_sha: &str, dir: &str) -> Result<String> {
+        // One crossing, the same fold as `stat` — and for the same reason:
+        // this was two git invocations plus one per untracked file, every
+        // time the drawer opens on a card with new files in it.
+        //
+        // The prefixes ride as positional parameters rather than being spliced
+        // into the script. They are built from a directory name, and a name is
+        // the one thing here nobody controls; `"$@"` hands them to git as argv
+        // with no shell reading them on the way.
         let prefix = prefix_args(dir);
-        let tracked = git(hr, worktree, &with_prefix(&prefix, &[base_sha]))?;
-        let untracked = git(
-            hr,
-            worktree,
-            &["ls-files", "--others", "--exclude-standard"],
-        )?;
-
-        let mut out = tracked;
-        for file in untracked.lines().filter(|l| !l.trim().is_empty()) {
-            // `--no-index` against /dev/null renders a new file as the patch
-            // that would create it, so it reads like the rest of the diff.
-            // It exits 1 when there is a difference, which there always is.
-            let args = with_prefix(&prefix, &["--no-index", "--", "/dev/null", file]);
-            let rendered = hr.run("git", &args, Some(worktree));
-            if let Ok(o) = rendered {
-                if !out.is_empty() && !out.ends_with('\n') {
-                    out.push('\n');
+        let mut args: Vec<&str> = vec![base_sha];
+        args.extend(prefix.iter().map(String::as_str));
+        let sections = if matches!(hr.host, Host::Local) {
+            let mut untracked = String::new();
+            let listed = git(hr, worktree, &["ls-files", "--others", "--exclude-standard"])?;
+            for file in listed.lines().filter(|l| !l.trim().is_empty()) {
+                let a = with_prefix(&prefix, &["--no-index", "--", "/dev/null", file]);
+                if let Ok(o) = hr.run("git", &a, Some(worktree)) {
+                    untracked.push_str(&String::from_utf8_lossy(&o.stdout));
                 }
-                out.push_str(&String::from_utf8_lossy(&o.stdout));
             }
+            vec![git(hr, worktree, &with_prefix(&prefix, &[base_sha]))?, untracked]
+        } else {
+            sh_sections(
+                hr,
+                worktree,
+                DIFF_SCRIPT,
+                &args,
+                2,
+                "reading the attempt's diff",
+            )?
+        };
+
+        // Concatenated exactly as before: the untracked patches follow the
+        // tracked ones, and each already ends in its own newline.
+        // `trim_end` on the tracked half so the two paths hand back the same
+        // string: the local branch goes through `git()`, which trims, and the
+        // batched one keeps the newline the script printed before its
+        // separator. A diff never opens with whitespace, so nothing is lost.
+        let mut out = sections[0].trim_end().to_string();
+        let untracked = sections[1].trim_start_matches('\n');
+        if !untracked.is_empty() {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(untracked);
         }
         Ok(out)
     }
@@ -740,50 +862,69 @@ impl Worktrees {
     ) -> Result<DiffStat> {
         let mut stat = DiffStat::default();
 
-        let tracked = git(hr, worktree, &["diff", "--numstat", base_sha])?;
-        for line in tracked.lines() {
-            stat.count(line);
-        }
-
-        let untracked = git(
-            hr,
-            worktree,
-            &["ls-files", "--others", "--exclude-standard"],
-        )?;
-        for file in untracked.lines().filter(|l| !l.trim().is_empty()) {
-            let counted = hr.run(
-                "git",
-                &["diff", "--no-index", "--numstat", "--", "/dev/null", file],
-                Some(worktree),
-            );
-            if let Ok(o) = counted {
-                for line in String::from_utf8_lossy(&o.stdout).lines() {
-                    stat.count(line);
+        // One crossing for the whole answer. This used to be four git
+        // invocations plus one per untracked file, and the board asks for it
+        // every fifteen seconds for every open attempt — locally that is four
+        // forks nobody notices, and through `wsl.exe` it is four Windows
+        // processes plus one per file, on a timer.
+        //
+        // The loop moves into the host rather than being removed: `--no-index`
+        // against /dev/null is still what renders a new file as the patch that
+        // would create it, and `add -N` — the way to avoid it — would mutate
+        // the agent's own index behind its back. So the same commands run, in
+        // the same order, on the far side of one doorway.
+        // Locally there is no doorway to cross, so there is nothing to fold
+        // — and there is a positive reason not to: `sh` is not on a Windows
+        // login-shell PATH, which is exactly why `Core::list_dir` keeps a
+        // native branch of its own. The four native forks cost microseconds
+        // here; it is the *crossing* that was expensive.
+        let sections = if matches!(hr.host, Host::Local) {
+            let range = format!("{base_branch}...HEAD");
+            let mut untracked_counts = String::new();
+            let listed = git(hr, worktree, &["ls-files", "--others", "--exclude-standard"])?;
+            for file in listed.lines().filter(|l| !l.trim().is_empty()) {
+                if let Ok(o) = hr.run(
+                    "git",
+                    &["diff", "--no-index", "--numstat", "--", "/dev/null", file],
+                    Some(worktree),
+                ) {
+                    untracked_counts.push_str(&String::from_utf8_lossy(&o.stdout));
                 }
             }
+            vec![
+                git(hr, worktree, &["diff", "--numstat", base_sha])?,
+                untracked_counts,
+                git(hr, worktree, &["rev-list", "--left-right", "--count", &range])?,
+                git(hr, worktree, &["status", "--porcelain"])?,
+            ]
+        } else {
+            sh_sections(
+                hr,
+                worktree,
+                STAT_SCRIPT,
+                &[base_sha, base_branch],
+                4,
+                "reading the attempt's footprint",
+            )?
+        };
+
+        for line in sections[0].lines() {
+            stat.count(line);
+        }
+        for line in sections[1].lines() {
+            stat.count(line);
         }
 
         // `left...right` with --left-right --count prints "behind\tahead"
         // from the branch's point of view.
-        let counts = git(
-            hr,
-            worktree,
-            &[
-                "rev-list",
-                "--left-right",
-                "--count",
-                &format!("{base_branch}...HEAD"),
-            ],
-        )?;
-        let mut parts = counts.split_whitespace();
+        let mut parts = sections[2].split_whitespace();
         stat.behind = parts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
         stat.ahead = parts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
 
         // Whether anything is still uncommitted — the exact check the merge
         // will make, run ahead of it, so the refusal can become a suggestion
         // before the click instead of an error after it.
-        let dirty = git(hr, worktree, &["status", "--porcelain"])?;
-        stat.dirty = !dirty.trim().is_empty();
+        stat.dirty = !sections[3].trim().is_empty();
 
         Ok(stat)
     }

@@ -207,6 +207,11 @@ impl Harness {
 export PATH="{path}"
 export HOME="{home}"
 export MAROL_STUB_LOG="{logs}"
+# One line per crossing, whatever the argv contains. Every process through
+# this door is the thing the batched reads exist to avoid, so the tests can
+# count them — and a script argument with newlines in it must not read as
+# several crossings, which is exactly what a batched read passes.
+printf '%s\n' "$(printf '%s ' "$@" | tr '\n' ' ')" >> "{logs}/wsl-calls"
 while [ $# -gt 0 ]; do
   case "$1" in
     -d|--shell-type) shift 2 ;;
@@ -415,6 +420,21 @@ exec "$@"
     fn wait_for_title(&self, id: &str, want: &str) -> String {
         wait_for(Duration::from_secs(5), || self.session(id).title == want);
         self.session(id).title
+    }
+
+    /// Forget every crossing so far, so the next count measures one act.
+    fn reset_crossings(&self) {
+        let _ = std::fs::remove_file(self.root.join("logs").join("wsl-calls"));
+    }
+
+    /// How many times the stand-in `wsl.exe` has been run since the reset.
+    ///
+    /// The number Phase 1 is about: locally each of these is a fork nobody
+    /// notices, and through a real `wsl.exe` it is a Windows process.
+    fn crossings(&self) -> Vec<String> {
+        std::fs::read_to_string(self.root.join("logs").join("wsl-calls"))
+            .map(|t| t.lines().map(str::to_string).collect())
+            .unwrap_or_default()
     }
 
     /// Post a hook report the way Claude Code's own hook runner would.
@@ -1730,6 +1750,109 @@ fn an_empty_followup_is_not_sent() {
     let a = h.start(&task, "claude");
 
     assert!(h.core.send_followup(&a.session_id, "  \n").is_err());
+}
+
+/* ---------------------------- crossings -------------------------------- */
+
+/// What Phase 1 actually bought, counted rather than described.
+///
+/// Every one of these reads used to cost a process per *question* through the
+/// doorway; they now cost a process per *answer*. Locally the difference is
+/// invisible — a fork is microseconds — which is exactly why the cost went
+/// unnoticed for so long, and why the number is pinned here against a world
+/// that has a door in front of it.
+///
+/// Exact counts rather than upper bounds. A bound would let a regression add
+/// one crossing per card per fifteen seconds and still pass.
+#[test]
+fn a_read_through_a_doorway_costs_one_crossing_not_one_per_question() {
+    let h = Harness::new("crossings");
+    let _guard = h.rt.enter();
+
+    let repo_url = format!("wsl://TestOS{}", h.repo.display());
+    let task = h
+        .core
+        .create_task("修好登入".into(), "make it work".into(), repo_url, "main".into(), Vec::new())
+        .expect("a wsl:// card");
+    let a = h.start(&task, "claude");
+    // The launch is its own crossing and it happens on a thread; waiting for
+    // it to be recorded is what stops it being counted against the read that
+    // follows.
+    h.launches(&a.session_id, 1);
+    let inner = a.worktree_path.strip_prefix("wsl://TestOS").unwrap().to_string();
+
+    // Untracked files are the ones that used to cost a crossing each: the
+    // count came from `git diff --no-index` per file, in a loop on this side
+    // of the door.
+    for n in 0..5 {
+        std::fs::write(Path::new(&inner).join(format!("new{n}.txt")), "hello\n").unwrap();
+    }
+
+    // The board's timer, which asks for this per open attempt every 15s.
+    h.reset_crossings();
+    let stat = h.core.attempt_stats(&a.attempt_id).expect("stats");
+    let calls = h.crossings();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the footprint cost {} crossings: {calls:#?}",
+        calls.len()
+    );
+    // And it is still the right answer, five untracked files included.
+    assert_eq!(stat.files, 5, "{stat:?}");
+
+    // The diff, which the drawer asks for on open.
+    h.reset_crossings();
+    let diff = h.core.attempt_diff(&a.attempt_id).expect("diff");
+    let calls = h.crossings();
+    assert_eq!(calls.len(), 1, "the diff cost {} crossings: {calls:#?}", calls.len());
+    assert!(diff.contains("new4.txt"), "the untracked files left the diff: {diff}");
+
+    // The Knows tab: six rules slots and two skill roots, which used to be
+    // six crossings plus a listing and a test per skill.
+    std::fs::create_dir_all(Path::new(&inner).join(".claude/skills/tidy")).unwrap();
+    std::fs::write(Path::new(&inner).join(".claude/skills/tidy/SKILL.md"), "x").unwrap();
+    std::fs::create_dir_all(Path::new(&inner).join(".claude/skills/notes")).unwrap();
+    h.reset_crossings();
+    let docs = h.core.agent_docs(&a.worktree_path).expect("docs");
+    let calls = h.crossings();
+    assert_eq!(
+        calls.len(),
+        3,
+        "the Knows tab cost {} crossings: {calls:#?}",
+        calls.len()
+    );
+    // A directory without a SKILL.md is somebody's notes, not a skill.
+    let skills: Vec<&str> = docs
+        .iter()
+        .filter(|d| d.kind == "skill")
+        .map(|d| d.name.as_str())
+        .collect();
+    assert_eq!(skills, vec!["tidy"], "{docs:#?}");
+    // And the rules slots are all still answered, present and absent alike.
+    assert!(docs.iter().any(|d| d.name == "CLAUDE.md" && d.kind == "rules"));
+
+    // The folder picker, one step of a walk.
+    h.reset_crossings();
+    let listing = h.core.list_dir("wsl://TestOS", Some(&inner)).expect("list");
+    let calls = h.crossings();
+    assert_eq!(calls.len(), 1, "one step cost {} crossings: {calls:#?}", calls.len());
+    assert!(listing.is_repo, "the worktree did not read as a checkout");
+    // The listing survives a directory whose *last* entry is a plain file.
+    // The script ends in a `for` loop, so its own exit status used to be the
+    // last `[ -d ]` test — and a folder ending in a file therefore answered
+    // "cannot be opened". Latent until something looked into a directory
+    // shaped like this one.
+    assert!(
+        listing.dirs.iter().any(|d| d == ".claude"),
+        "the walk stopped early: {:?}",
+        listing.dirs
+    );
+    assert!(
+        !listing.dirs.iter().any(|d| d.ends_with(".txt")),
+        "a plain file was offered as a directory: {:?}",
+        listing.dirs
+    );
 }
 
 /* -------------------------- session to session ------------------------- */

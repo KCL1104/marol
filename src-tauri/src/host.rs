@@ -443,6 +443,41 @@ fn ssh_base_args(tty: bool) -> Vec<String> {
     args
 }
 
+/// The exit status these scripts use for "the file is not there".
+///
+/// A number of our own because the shells' own are taken: `cat` and `tail`
+/// both exit 1 for a missing file *and* for one they were not allowed to
+/// read, and this app has always insisted those are different answers — one
+/// is `Ok(None)`, the other is an error worth showing.
+const ABSENT: i32 = 3;
+
+/// `cat` the file, or say plainly that it is not there.
+const READ_IF_PRESENT: &str = r#"if [ -e "$1" ]; then cat -- "$1"; else exit 3; fi"#;
+
+/// The same, from a byte offset — the append-only transcript read.
+const TAIL_IF_PRESENT: &str = r#"if [ -e "$1" ]; then tail -c "$2" -- "$1"; else exit 3; fi"#;
+
+/// `1` or `0` per path, in the order given.
+const EXIST_ALL: &str = r#"for p in "$@"; do
+  if [ -e "$p" ]; then echo 1; else echo 0; fi
+done"#;
+
+/// The skill names under each root, one U+001E-separated section per root.
+///
+/// `$root/*/SKILL.md` rather than a listing plus a test apiece: the glob is
+/// the filter, and an unmatched glob stays literal in `sh`, which is why the
+/// existence of the file is checked before the name is printed.
+const SKILLS_IN: &str = r#"first=1
+for root in "$@"; do
+  [ $first -eq 1 ] || printf '\036'
+  first=0
+  for d in "$root"/*/; do
+    [ -f "$d/SKILL.md" ] || continue
+    b=${d%/}
+    printf '%s\n' "${b##*/}"
+  done
+done"#;
+
 /// A host together with both environments commands need: the app machine's
 /// (`local`, which finds `wsl.exe`) and the host's own (`env`, whose PATH
 /// finds what runs inside). Built by the core from its per-host cache and
@@ -581,6 +616,95 @@ impl HostRef<'_> {
         }
     }
 
+    /// Which of these exist, in the order asked.
+    ///
+    /// One crossing for the whole list. Locally it stays a syscall apiece,
+    /// because locally that is what one crossing costs anyway — and because
+    /// `sh` is not on a Windows login-shell PATH, which is the same reason
+    /// `Core::list_dir` keeps a native branch.
+    ///
+    /// A failure answers "none of them", which is what every caller means by
+    /// a path it cannot reach: `agent_docs` lists a rules file that is not
+    /// there just as deliberately as one that is, and "absent" is the honest
+    /// reading of a world that would not answer.
+    pub fn exist_all(&self, paths: &[&str]) -> Vec<bool> {
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        match self.host {
+            Host::Local => paths
+                .iter()
+                .map(|p| std::path::Path::new(p).exists())
+                .collect(),
+            _ => {
+                let mut argv: Vec<&str> = vec!["-c", EXIST_ALL, "_"];
+                argv.extend(paths.iter().copied());
+                let answered = self
+                    .run_ok("sh", &argv, None)
+                    .map(|out| out.lines().map(|l| l == "1").collect::<Vec<bool>>())
+                    .unwrap_or_default();
+                // A short answer is a broken one; padding with `false` beats
+                // zipping a mismatched list onto the paths it describes.
+                paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| answered.get(i).copied().unwrap_or(false))
+                    .collect()
+            }
+        }
+    }
+
+    /// The skill directories under each root — the ones that actually hold a
+    /// `SKILL.md`, since a directory without one is somebody's notes.
+    ///
+    /// One crossing for every root together, where this used to be a listing
+    /// per root plus a `test -e` per entry.
+    pub fn skills_in(&self, roots: &[&str]) -> Vec<Vec<String>> {
+        if roots.is_empty() {
+            return Vec::new();
+        }
+        match self.host {
+            Host::Local => roots
+                .iter()
+                .map(|root| {
+                    let mut names: Vec<String> = std::fs::read_dir(root)
+                        .map(|it| {
+                            it.flatten()
+                                .filter(|e| e.path().join("SKILL.md").exists())
+                                .map(|e| e.file_name().to_string_lossy().into_owned())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    names.sort();
+                    names
+                })
+                .collect(),
+            _ => {
+                let mut argv: Vec<&str> = vec!["-c", SKILLS_IN, "_"];
+                argv.extend(roots.iter().copied());
+                let text = self.run_ok("sh", &argv, None).unwrap_or_default();
+                // One section per root, in the order asked, so a root that
+                // holds nothing is an empty section rather than a missing one.
+                let mut sections = text.split('\u{1e}');
+                roots
+                    .iter()
+                    .map(|_| {
+                        sections
+                            .next()
+                            .map(|s| {
+                                s.lines()
+                                    .map(str::trim)
+                                    .filter(|l| !l.is_empty())
+                                    .map(str::to_string)
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            }
+        }
+    }
+
     pub fn mkdir_p(&self, path: &str) -> Result<()> {
         match self.host {
             Host::Local => Ok(std::fs::create_dir_all(path)?),
@@ -601,19 +725,25 @@ impl HostRef<'_> {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(e.into()),
             },
+            // One crossing, not two. Asking `exists` and then `cat` is two
+            // processes through the doorway to answer one question, and
+            // through `wsl.exe` a process is the expensive part — locally
+            // both are a syscall, which is why the cost never showed here.
+            //
+            // The M6 distinction survives the fold: `cat` alone cannot tell
+            // an absent file from an unreadable one, so absence gets a status
+            // of its own rather than being inferred from a failure.
             _ => {
-                if !self.exists(path) {
-                    return Ok(None);
-                }
-                // Raw stdout, not `run_ok`'s trim: file text is content.
-                let out = self.run("cat", &[path], None)?;
-                if !out.status.success() {
-                    return Err(anyhow!(
+                let out = self.run("sh", &["-c", READ_IF_PRESENT, "_", path], None)?;
+                match out.status.code() {
+                    Some(ABSENT) => Ok(None),
+                    // Raw stdout, not `run_ok`'s trim: file text is content.
+                    Some(0) => Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned())),
+                    _ => Err(anyhow!(
                         "reading {path}: {}",
                         String::from_utf8_lossy(&out.stderr).trim()
-                    ));
+                    )),
                 }
-                Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()))
             }
         }
     }
@@ -637,20 +767,21 @@ impl HostRef<'_> {
                 f.read_to_end(&mut buf)?;
                 Ok(Some(buf))
             }
+            // Folded the same way `read_to_string` is, and it matters more
+            // here: this one runs once per turn, per session, to keep the
+            // token account.
             _ => {
-                if !self.exists(path) {
-                    return Ok(None);
-                }
                 // `tail -c +N` is 1-based: +1 is the whole file.
                 let from = format!("+{}", offset.saturating_add(1));
-                let out = self.run("tail", &["-c", &from, "--", path], None)?;
-                if !out.status.success() {
-                    return Err(anyhow!(
+                let out = self.run("sh", &["-c", TAIL_IF_PRESENT, "_", path, &from], None)?;
+                match out.status.code() {
+                    Some(ABSENT) => Ok(None),
+                    Some(0) => Ok(Some(out.stdout)),
+                    _ => Err(anyhow!(
                         "reading {path} from byte {offset}: {}",
                         String::from_utf8_lossy(&out.stderr).trim()
-                    ));
+                    )),
                 }
-                Ok(Some(out.stdout))
             }
         }
     }

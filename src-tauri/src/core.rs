@@ -1408,11 +1408,19 @@ pub struct WorldProbe {
 /// as readily as on a WSL Ubuntu. An empty directory leaves the globs
 /// unexpanded and `[ -d ]` discards the literals, which is why there is no
 /// `nullglob` here to depend on.
-const LIST_DIR: &str = r#"pwd -P
+/// The resolved path, whether this is a checkout, then the directories.
+///
+/// Three answers, one crossing. The repository check used to be an `exists`
+/// of its own after the listing came back, which through a doorway is a
+/// second process for one bit — and the picker asks on every step of a walk
+/// down somebody's home directory.
+const LIST_DIR: &str = r#"pwd -P || exit 1
+[ -e .git ] && echo repo || echo plain
 for e in .* *; do
   case "$e" in .|..) continue;; esac
   [ -d "$e" ] && printf '%s\n' "$e"
-done"#;
+done
+exit 0"#;
 
 /// Where `..` goes from an absolute path, or `None` at a root.
 ///
@@ -3246,34 +3254,46 @@ impl Core {
             })
             .unwrap_or_else(|| vec![(String::new(), loc.path.clone())]);
 
+        // Every rules slot is decided in one crossing rather than one each.
+        // Six `test -e` calls was six processes through a doorway to answer
+        // six bits, and this tab is opened by a person who is waiting.
+        let mut slots: Vec<(&'static str, &'static str, &'static str, String, String)> =
+            Vec::new();
         for (dir, project) in &projects {
             for (name, agent) in agent::DOCS.project_rules {
-                let path = hr.join(project, name);
-                out.push(AgentDoc {
-                    scope: "project",
+                slots.push((
+                    "project",
                     agent,
-                    kind: "rules",
-                    dir: dir.clone(),
-                    exists: hr.exists(&path),
-                    name: name.to_string(),
-                    path,
-                });
+                    "rules",
+                    dir.clone(),
+                    hr.join(project, name),
+                ));
             }
         }
-
         if let Some(home) = home.as_deref() {
             for (dir, name, agent) in agent::DOCS.global_rules {
-                let path = hr.join(&hr.join(home, dir), name);
-                out.push(AgentDoc {
-                    scope: "global",
+                slots.push((
+                    "global",
                     agent,
-                    kind: "rules",
-                    dir: String::new(),
-                    exists: hr.exists(&path),
-                    name: name.to_string(),
-                    path,
-                });
+                    "rules",
+                    String::new(),
+                    hr.join(&hr.join(home, dir), name),
+                ));
             }
+        }
+        let paths: Vec<&str> = slots.iter().map(|(_, _, _, _, p)| p.as_str()).collect();
+        let present = hr.exist_all(&paths);
+        for ((scope, agent, kind, dir, path), exists) in slots.into_iter().zip(present) {
+            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+            out.push(AgentDoc {
+                scope,
+                agent,
+                kind,
+                dir,
+                exists,
+                name,
+                path,
+            });
         }
 
         // One directory per skill, each holding a SKILL.md. A directory
@@ -3295,23 +3315,25 @@ impl Core {
                     .map(|h| hr.join(&hr.join(h, dir), "skills"))
                     .unwrap_or_default(),
             ));
-            for (scope, where_, root) in roots {
-                if root.is_empty() {
-                    continue;
-                }
-                for entry in hr.list_dir(&root) {
+            // A listing plus one `test -e` per entry was the worst of these:
+            // somebody with twenty skills paid twenty-one crossings for one
+            // tab. `skills_in` asks each root for the names that actually
+            // hold a SKILL.md, and answers for every root at once.
+            let live: Vec<(&'static str, String, String)> =
+                roots.into_iter().filter(|(_, _, r)| !r.is_empty()).collect();
+            let listings = hr.skills_in(&live.iter().map(|(_, _, r)| r.as_str()).collect::<Vec<_>>());
+            for ((scope, where_, root), names) in live.into_iter().zip(listings) {
+                for entry in names {
                     let path = hr.join(&hr.join(&root, &entry), "SKILL.md");
-                    if hr.exists(&path) {
-                        out.push(AgentDoc {
-                            scope,
-                            agent,
-                            kind: "skill",
-                            dir: where_.clone(),
-                            exists: true,
-                            name: entry,
-                            path,
-                        });
-                    }
+                    out.push(AgentDoc {
+                        scope,
+                        agent,
+                        kind: "skill",
+                        dir: where_.clone(),
+                        exists: true,
+                        name: entry,
+                        path,
+                    });
                 }
             }
         }
@@ -3554,6 +3576,9 @@ impl Core {
                 .unwrap_or_else(|| "/".to_string()),
         };
 
+        // Answered by the listing itself for a world behind a doorway; still
+        // a filesystem question locally, where it costs nothing.
+        let mut remote_repo: Option<bool> = None;
         let (resolved, mut dirs) = match &he.host {
             // Locally this is a filesystem call, not a shell. Windows is the
             // reason: `sh` is not on a Windows login-shell PATH, and the one
@@ -3590,6 +3615,8 @@ impl Core {
                     .next()
                     .ok_or_else(|| anyhow!("{start} answered with nothing"))?
                     .to_string();
+                let is_repo = lines.next() == Some("repo");
+                remote_repo = Some(is_repo);
                 (resolved, lines.map(|s| s.to_string()).collect())
             }
         };
@@ -3605,7 +3632,10 @@ impl Core {
         });
 
         let parent = parent_of(&resolved);
-        let is_repo = hr.exists(&hr.join(&resolved, ".git"));
+        let is_repo = match remote_repo {
+            Some(answered) => answered,
+            None => hr.exists(&hr.join(&resolved, ".git")),
+        };
         Ok(DirListing {
             path: resolved,
             parent,
