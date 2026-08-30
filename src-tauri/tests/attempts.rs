@@ -97,6 +97,11 @@ struct Harness {
 /// test's boot by the probe's timeout.
 const STUB: &str = r#"#!/bin/bash
 if [ "$1" = "--version" ]; then echo "2.1.226 (Claude Code)"; exit 0; fi
+# The real CLI's own updater: it works out how this copy was installed and
+# upgrades it. Answered here rather than falling through, because the line
+# below records a *launch*, and an update recorded as one would have the
+# harness believe a session started that never did.
+if [ "$1" = "update" ]; then printf '%s\n' "${0##*/}" >> "$MAROL_STUB_LOG/updates"; exit 0; fi
 printf '%s\0' "$PWD" "${MAROL_NAME_URL:-}" "${MAROL_PEERS_URL:-}" "${MAROL_SEND_URL:-}" "$@" > "$MAROL_STUB_LOG/${MAROL_SESSION_ID:-unknown}.$$"
 # 宣告它所替身的那個 CLI 真的會宣告的模式:Claude Code 開啟 bracketed
 # paste(DECSET 2004),而 `bracketed_followup` 只送給量測過會開它的 CLI。
@@ -115,6 +120,7 @@ exec cat > "$MAROL_STUB_LOG/stdin.${MAROL_SESSION_ID:-unknown}.$$"
 /// that shape pass.
 const CODEX_STUB: &str = r#"#!/bin/bash
 if [ "$1" = "--version" ]; then echo "codex-cli 0.147.0"; exit 0; fi
+if [ "$1" = "update" ]; then printf '%s\n' "${0##*/}" >> "$MAROL_STUB_LOG/updates"; exit 0; fi
 printf '%s\0' "$PWD" "${MAROL_NAME_URL:-}" "${MAROL_PEERS_URL:-}" "${MAROL_SEND_URL:-}" "$@" > "$MAROL_STUB_LOG/${MAROL_SESSION_ID:-unknown}.$$"
 printf '\033[?2004h'
 exec cat > "$MAROL_STUB_LOG/stdin.${MAROL_SESSION_ID:-unknown}.$$"
@@ -124,6 +130,7 @@ exec cat > "$MAROL_STUB_LOG/stdin.${MAROL_SESSION_ID:-unknown}.$$"
 /// given for the tests that assert it was given nothing of ours.
 const UNMEASURED_STUB: &str = r#"#!/bin/bash
 if [ "$1" = "--version" ]; then echo "0.9.0"; exit 0; fi
+if [ "$1" = "update" ]; then printf '%s\n' "${0##*/}" >> "$MAROL_STUB_LOG/updates"; exit 0; fi
 printf '%s\0' "$PWD" "${MAROL_NAME_URL:-}" "${MAROL_PEERS_URL:-}" "${MAROL_SEND_URL:-}" "$@" > "$MAROL_STUB_LOG/${MAROL_SESSION_ID:-unknown}.$$"
 exec cat > "$MAROL_STUB_LOG/stdin.${MAROL_SESSION_ID:-unknown}.$$"
 "#;
@@ -132,6 +139,7 @@ exec cat > "$MAROL_STUB_LOG/stdin.${MAROL_SESSION_ID:-unknown}.$$"
 /// What matters is what it is NOT handed: `--name` would stop it starting.
 const OLD_STUB: &str = r#"#!/bin/bash
 if [ "$1" = "--version" ]; then echo "2.0.14 (Claude Code)"; exit 0; fi
+if [ "$1" = "update" ]; then printf '%s\n' "${0##*/}" >> "$MAROL_STUB_LOG/updates"; exit 0; fi
 printf '%s\0' "$PWD" "${MAROL_NAME_URL:-}" "${MAROL_PEERS_URL:-}" "${MAROL_SEND_URL:-}" "$@" > "$MAROL_STUB_LOG/${MAROL_SESSION_ID:-unknown}.$$"
 exec cat > "$MAROL_STUB_LOG/stdin.${MAROL_SESSION_ID:-unknown}.$$"
 "#;
@@ -2004,6 +2012,86 @@ fn a_codex_session_can_message_a_claude_session_and_it_arrives_marked() {
     let act = sender.activity.expect("the sender reports no activity");
     assert_eq!(act.tool, "SendMessage");
     assert!(act.detail.starts_with("→ Fix login"), "{:?}", act.detail);
+}
+
+/// Keeping the agents current is asking them, not doing it.
+///
+/// `claude update` and `codex update` each work out how that copy was
+/// installed — npm global, native installer, Homebrew cask, apt package —
+/// and run that method's upgrade. A desk that did the install-method
+/// detection itself would be wrong in the one way that matters: `npm install
+/// -g` over a native install does not replace it, it adds a second one and
+/// leaves which binary runs to whichever directory PATH names first.
+///
+/// So what is pinned here is the asking: each installed CLI in the world,
+/// once, with the subcommand it actually documents.
+#[test]
+fn each_installed_agent_is_asked_to_update_itself() {
+    let h = Harness::new("agentup");
+    let _guard = h.rt.enter();
+    // Resolving a world is what triggers the pass; a card is the ordinary
+    // way one gets resolved.
+    let _ = h.card("Fix login", "make it work");
+
+    let log = h.root.join("logs/updates");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let asked = loop {
+        let asked = std::fs::read_to_string(&log).unwrap_or_default();
+        if asked.contains("claude") && asked.contains("codex") {
+            break asked;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the agents were never asked to update: {asked:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    // Once each. The pass runs when a world is first reached, and a world
+    // reached again is the same world — asking twice would double a download
+    // somebody is paying for in bandwidth and in waiting.
+    let _ = h.card("Port the tests", "port them");
+    std::thread::sleep(Duration::from_millis(300));
+    let after = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        after.lines().filter(|l| l.trim() == "claude").count(),
+        1,
+        "claude was asked more than once: {after:?}"
+    );
+    assert_eq!(asked.lines().count(), 2, "something else was asked: {asked:?}");
+}
+
+/// The switch, and that it outlives the window.
+///
+/// It has to exist at all because this app measures the CLIs it drives —
+/// `agent-parity.yml` is a whole workflow devoted to noticing when one of
+/// them renames a flag — and an upgrade this desk performed unattended is
+/// exactly how somebody ends up on the version that moved. Automatic is the
+/// default because it is what was asked for; pinning has to stay possible.
+#[test]
+fn the_agent_update_switch_is_remembered() {
+    let h = Harness::new("agentupoff");
+    let _guard = h.rt.enter();
+    assert!(h.core.agent_updates_on(), "the default is on");
+
+    h.core.set_agent_updates_on(false).expect("store the switch");
+    assert!(!h.core.agent_updates_on());
+
+    h.core.shutdown();
+    let core2 = h
+        .rt
+        .block_on(Core::start_with(
+            h.env.clone(),
+            Arc::new(Events::default()) as Arc<dyn UiSink>,
+            h.root.join("marol.db"),
+            h.root.join("data"),
+            h.root.join("worktrees"),
+        ))
+        .expect("second core");
+    assert!(
+        !core2.agent_updates_on(),
+        "a desk that was told not to update the agents did it anyway on the next start"
+    );
 }
 
 /// The brake on an unattended chain.

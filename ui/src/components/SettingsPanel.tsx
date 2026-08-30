@@ -81,7 +81,15 @@ const SECTIONS: readonly { id: SectionId; title: MessageKey; terms: readonly Mes
   {
     id: 'updates',
     title: 'set.updates',
-    terms: ['up.check', 'up.enabled', 'up.apply', 'env.version', 'up.lastCheck'],
+    terms: [
+      'up.check',
+      'up.enabled',
+      'up.apply',
+      'env.version',
+      'up.lastCheck',
+      'ag.title',
+      'ag.onStart',
+    ],
   },
   {
     id: 'diagnostics',
@@ -293,7 +301,16 @@ export function SettingsPanel({
 
             {section === 'notifications' && <Notifications />}
 
-            {section === 'updates' && <Updates />}
+            {/* Marol's own updates, then the agents'. Same section because
+                they are the same question asked of two things, and a person
+                looking for "why am I being told to update" should not have
+                to know which of the two is doing the telling. */}
+            {section === 'updates' && (
+              <>
+                <Updates />
+                <AgentUpdates boot={boot} />
+              </>
+            )}
 
             {section === 'agents' && (
               <>
@@ -744,6 +761,80 @@ function Checkpoints() {
           Stop hook, and Codex fires Stop. Naming both is what stops a Codex
           user reading a working feature as somebody else's. */}
       <p className="muted small">{t('ckpt.onStopHint')}</p>
+    </div>
+  );
+}
+
+/**
+ * Keeping the agent CLIs current, and saying what that did.
+ *
+ * The command is theirs: `claude update` and `codex update` each work out
+ * how that copy was installed — npm global, native installer, Homebrew cask,
+ * apt package — and run that method's upgrade. This desk only asks. Doing it
+ * here instead would mean guessing the install method, and `npm install -g`
+ * over a native install does not replace it; it adds a second one and leaves
+ * which binary runs to whichever directory PATH names first.
+ *
+ * The report below the switch is per world, because the CLIs are per world:
+ * a WSL distro has its own claude at its own version, and updating the one
+ * on the Windows side would leave the one that actually runs untouched.
+ */
+function AgentUpdates({ boot }: { boot: BootStatus }) {
+  const { t } = useI18n();
+  const [on, setOn] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    void api
+      .agentUpdatesEnabled()
+      .then(setOn)
+      .catch(() => {
+        /* the panel's other sections still work; the row simply stays out */
+      });
+  }, []);
+
+  if (on === null) return null;
+  const rows = boot.agentUpdates ?? [];
+
+  return (
+    <div data-testid="agent-updates">
+      <h3 className="modal-section">{t('ag.title')}</h3>
+      <p className="muted small">{t('ag.hint')}</p>
+      <label className="notify-row">
+        <input
+          type="checkbox"
+          checked={on}
+          data-testid="ag-toggle"
+          onChange={() => {
+            const next = !on;
+            setOn(next);
+            void api.setAgentUpdatesEnabled(next).catch(() => setOn(on));
+          }}
+        />
+        {t('ag.onStart')}
+      </label>
+      <p className="muted small">{t('ag.onStartHint')}</p>
+      {/* What actually happened, rather than what was attempted. The rows
+          come from comparing the version before with the version after, so
+          "already current" is a measurement and not the CLI's own wording. */}
+      {on && (
+        <div className="chips" data-testid="ag-report">
+          {rows.length === 0 && <span className="muted small">{t('ag.none')}</span>}
+          {rows.map((r) => (
+            <span className="chip" key={`${r.world}-${r.agent}`}>
+              {r.outcome === 'updated'
+                ? t('ag.updated', {
+                    agent: r.agent,
+                    world: r.world,
+                    from: r.from ?? '—',
+                    to: r.to ?? '—',
+                  })
+                : r.outcome === 'current'
+                  ? t('ag.current', { agent: r.agent, world: r.world, to: r.to ?? '—' })
+                  : t('ag.failed', { agent: r.agent, world: r.world, detail: r.detail })}
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

@@ -44,6 +44,90 @@ test.describe('cross-session messaging surfaces', () => {
   });
 
   /**
+   * Keeping the agent CLIs current, and saying what it did.
+   *
+   * The report is per world because the CLIs are per world: a WSL distro has
+   * its own claude at its own version, and updating the one on the Windows
+   * side would leave the one that actually runs untouched. And it reports
+   * what changed rather than what was attempted — "already current" is a
+   * measured version, not the CLI's own wording, which has changed before.
+   */
+  test('the agent updates say what happened, per world', async ({ page }) => {
+    await page.addInitScript(installMock);
+    await page.addInitScript(() => {
+      const internals = (
+        window as unknown as {
+          __TAURI_INTERNALS__: { invoke: (c: string, a?: unknown) => Promise<unknown> };
+        }
+      ).__TAURI_INTERNALS__;
+      const original = internals.invoke.bind(internals);
+      internals.invoke = (cmd: string, args?: unknown) =>
+        cmd === 'boot_status'
+          ? original(cmd, args).then((b) => ({
+              ...(b as object),
+              agentUpdates: [
+                {
+                  world: 'wsl:Ubuntu',
+                  agent: 'codex',
+                  from: '0.145.0',
+                  to: '0.151.0',
+                  outcome: 'updated',
+                  detail: '',
+                },
+                {
+                  world: 'wsl:Ubuntu',
+                  agent: 'claude',
+                  from: '2.1.226',
+                  to: '2.1.226',
+                  outcome: 'current',
+                  detail: '',
+                },
+                {
+                  world: 'ssh:build',
+                  agent: 'codex',
+                  from: '0.140.0',
+                  to: '0.140.0',
+                  outcome: 'failed',
+                  detail: 'unrecognized subcommand',
+                },
+              ],
+            }))
+          : original(cmd, args);
+    });
+    await page.goto('/');
+    await expect(page.locator('.tab')).toHaveCount(1);
+
+    await page.locator('.sidebar-foot').click();
+    await page.getByTestId('sec-updates').click();
+    const report = page.getByTestId('ag-report');
+    await expect(report).toContainText('wsl:Ubuntu 的 codex：0.145.0 → 0.151.0');
+    // Already current is worth a row too: it is the difference between "the
+    // pass ran and there was nothing to do" and "the pass never reached here".
+    await expect(report).toContainText('wsl:Ubuntu 的 claude：已經是 2.1.226');
+    // A refusal names itself rather than being folded into silence.
+    await expect(report).toContainText('ssh:build 的 codex：更新不了（unrecognized subcommand）');
+  });
+
+  /** Off means off: no rows, and the desk asks nothing of anybody's CLI. */
+  test('the agent update pass can be switched off', async ({ page }) => {
+    await page.addInitScript(installMock);
+    await page.goto('/');
+    await expect(page.locator('.tab')).toHaveCount(1);
+
+    await page.locator('.sidebar-foot').click();
+    await page.getByTestId('sec-updates').click();
+    const toggle = page.getByTestId('ag-toggle');
+    await expect(toggle).toBeChecked();
+    await expect(page.getByTestId('ag-report')).toBeVisible();
+
+    await toggle.uncheck();
+    await expect(toggle).not.toBeChecked();
+    // The report goes with it: it describes a pass that is no longer run,
+    // and leaving it up would read as one that still is.
+    await expect(page.getByTestId('ag-report')).toHaveCount(0);
+  });
+
+  /**
    * The held shells are worth a row precisely because declining is silent.
    *
    * A world with no `sh` on the far side, or a pool that is always

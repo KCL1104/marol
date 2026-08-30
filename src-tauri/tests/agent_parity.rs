@@ -179,6 +179,31 @@ fn every_flag_this_app_passes_is_one_the_installed_cli_accepts() {
             }
         }
 
+        // Updating is the CLI's own job and this app only asks for it, so
+        // what has to keep being true is that the asking still works: the
+        // subcommand exists and is a subcommand. It is measured for the same
+        // reason as the rest — the desk runs it unattended at startup, and a
+        // rename would turn a silent success into a silent failure, which is
+        // the worst of the two silences because the person keeps being told
+        // by the CLI to update and keeps believing it was already done.
+        //
+        // Only that it is *recognised*. Running it for real here would
+        // upgrade the runner's CLI mid-test and measure the parity of a
+        // version this run never probed.
+        assert!(
+            vocabulary.contains(agent::UPDATE_SUBCOMMAND),
+            "`{}` no longer lists `{}` on its front page\n--- help ---\n{help}",
+            cli.name(),
+            agent::UPDATE_SUBCOMMAND
+        );
+        let update_help = output(&exe, &[agent::UPDATE_SUBCOMMAND, "--help"], &env);
+        assert!(
+            words(&update_help).contains(agent::UPDATE_SUBCOMMAND),
+            "`{} {}` is no longer a subcommand of its own\n--- help ---\n{update_help}",
+            cli.name(),
+            agent::UPDATE_SUBCOMMAND
+        );
+
         // And the first message still rides on the command line. Both CLIs
         // spell the slot the same way in their usage line; a CLI that
         // stopped taking one would leave every attempt started but silent.

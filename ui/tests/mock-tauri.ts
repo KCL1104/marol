@@ -130,6 +130,7 @@ declare global {
       notifyPrefs: { permission: boolean; input: boolean; done: boolean };
       /** Whether the end of a turn snapshots the worktree — default on. */
       checkpointsOn: boolean;
+      agentUpdatesOn: boolean;
       /** Each attempt's checkpoints, as the refs would hold them. */
       checkpoints: Map<string, Array<{ n: number; sha: string; at: number }>>;
       /** Makes the next manual checkpoint answer "nothing new". */
@@ -233,6 +234,7 @@ export function installMock(): void {
     profiles: [] as Array<{ name: string; agent: string; args: string[] }>,
     notifyPrefs: { permission: true, input: true, done: false },
     checkpointsOn: true,
+    agentUpdatesOn: true,
     checkpoints: new Map<string, Array<{ n: number; sha: string; at: number }>>(),
     checkpointQuiet: false,
     /** One directory tree per world, keyed by the world's own prefix. The
@@ -1090,6 +1092,13 @@ export function installMock(): void {
     },
 
     checkpoints_enabled: () => mock.checkpointsOn,
+
+    agent_updates_enabled: () => mock.agentUpdatesOn,
+
+    set_agent_updates_enabled: (args) => {
+      mock.agentUpdatesOn = Boolean(args.on);
+      return null;
+    },
 
     set_checkpoints_enabled: (args) => {
       mock.checkpointsOn = Boolean(args.on);
