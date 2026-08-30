@@ -1979,6 +1979,24 @@ impl Core {
         Ok(he)
     }
 
+    /// What each world's held shells have actually done, for the panel.
+    ///
+    /// Local is left out because it has no doorway to save a crossing of:
+    /// commands there are spawned natively and always were, so a row saying
+    /// "0 held" would read as a fault rather than as the absence of one.
+    ///
+    /// Only worlds that have been reached appear, which is the honest set:
+    /// a distro nobody has opened a card in has no shells and no story.
+    pub fn channel_tallies(&self) -> Vec<(String, crate::channel::Tally)> {
+        let hosts = self.hosts.lock().unwrap();
+        let mut rows: Vec<(String, crate::channel::Tally)> = hosts
+            .values()
+            .filter_map(|he| Some((host::label(&he.host)?, he.channels.tally())))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
     /// Split a stored path and resolve its host in one motion — the shape
     /// nearly every caller wants.
     fn located(&self, raw: &str) -> Result<(host::Located, Arc<HostEnv>)> {

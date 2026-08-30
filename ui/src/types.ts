@@ -244,6 +244,12 @@ export interface BootStatus {
   /** Whether this desk's claude sessions can name themselves and, with
       that, message each other across cards. */
   messaging?: boolean;
+  /** What each non-local world's held shells have done since the app
+      started: commands answered without starting a process, commands handed
+      back to be spawned the old way, and commands sent whose answer never
+      came. Declining is silent by design, so a world where the channel never
+      opens looks exactly like a working one until these say otherwise. */
+  channels?: { world: string; held: number; spawned: number; lost: number }[];
   db?: string;
   hookUrl?: string | null;
   /** The opening-prompt template on disk — the one text this desk adds to a
