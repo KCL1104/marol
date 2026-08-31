@@ -593,13 +593,25 @@ mod tests {
             .expect("a local sh");
         ch.child.lock().unwrap().kill().expect("kill");
         let _ = ch.child.lock().unwrap().wait();
-        // The pipe has no reader. Writing to it is the failure, and it
-        // happens before `sh` could have been given anything.
-        let failed = ch.run("echo hi").expect_err("a dead shell answered");
+        // A pipe whose reader is gone does not necessarily refuse the first
+        // write — the buffer may still take it, and then the *read* is what
+        // fails, which is the other case and is reported as such. Keep going
+        // until the pipe itself says no: that is the case under test, and the
+        // one where nothing can have run.
+        let mut unsent = None;
+        for _ in 0..64 {
+            match ch.run("echo hi") {
+                Ok(_) => panic!("a killed shell answered a command"),
+                Err(f) if !f.launched => {
+                    unsent = Some(f);
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
         assert!(
-            !failed.launched,
-            "a command that was never written was called lost: {:#}",
-            failed.why
+            unsent.is_some(),
+            "a write to a dead pipe never reported itself as unsent"
         );
     }
 

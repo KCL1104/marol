@@ -1174,6 +1174,49 @@ They are not translations of each other, and nothing here pretends they are:
 | session names | `--name`, and the CLI's own messaging with it | none |
 | messaging between cards | through Marol's own channel | the same channel |
 | token ledger | one row per message | a running total |
+| staying current | `claude update` | `codex update` |
+
+**Keeping them current is asking them, not doing it.** Both CLIs ship an
+updater that works out how *that* copy was installed — npm global, native
+installer, Homebrew cask, apt package — and runs that method's upgrade, so
+Marol asks and does not guess. Guessing is the part that goes wrong: `npm
+install -g` over a native install does not replace it, it adds a second one
+and leaves which `claude` runs to whichever directory `PATH` names first.
+
+It is also the check. Neither offers a look-without-touching mode — Codex's
+takes no flags at all — so "is there a new one" and "get it" are the same
+command, and a CLI already current answers by saying so.
+
+The pass runs once per world, the first time Marol reaches that world, which
+for the worlds you use is when it opens. Per world because the CLIs are per
+world: a WSL distro has its own `claude` at its own version, and updating the
+one on the Windows side would leave the one that actually runs untouched. It
+is off the startup path and nothing waits on it — both CLIs install the new
+version beside the running one and hand it to the next session you start,
+never to one already open, and an update that fails leaves the CLI at the
+version Marol already probed and gated on. Afterwards the version is
+re-probed, because a launch has to be decided by the binary it will actually
+get rather than the one measured a moment before the upgrade.
+
+A CLI that is not installed in a world is left alone. Installing an agent on
+somebody's machine is a different act from updating one they chose to have.
+
+**Settings → Updates has the switch, and the report.** Default on, because
+being told to update by the thing you are already talking to is the whole
+annoyance. Off exists because this repository *measures* these CLIs —
+`agent-parity.yml` is a workflow devoted to catching one of them renaming a
+flag — and an upgrade performed unattended is exactly how somebody lands on
+the version that moved. The report says what changed, per world, from which
+version to which, and names a refusal rather than folding it into silence.
+It is decided by probing the version before and after, not by reading the
+CLI's own success message: those are words, and words have changed before.
+
+One thing it deliberately does not do: Homebrew, WinGet and the Linux package
+managers do not auto-update, and Claude Code will run their upgrade for you
+only if `CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE=1` is set. Marol does not set
+it. `brew upgrade` is a system package operation, and reaching into somebody's
+package manager is further than "keep my agents current" asks to go — set it
+yourself if that is the install you have.
 
 Neither wiring writes into your own configuration. An app that injected
 itself into `~/.claude/settings.json` or `~/.codex/config.toml` is an app that
@@ -1264,6 +1307,38 @@ that is the supervision the ceiling exists to require. The drawer shows the
 depth from the first relay, so you can watch three become five and step in
 before anything is refused on your behalf, and the card says so when a
 message is actually held back.
+
+**Codex reaches the desk through its own hook, because it cannot reach it any
+other way.** Codex sandboxes the shell it gives the model and denies it every
+socket family but `AF_UNIX` — the seccomp filter allows `socket()` only when
+the first argument is `AF_UNIX`, with no carve-out for loopback. So a `curl`
+to this desk fails inside `socket()`, and the model, seeing a connection
+error, reports the desk as down when it is running perfectly. That is not a
+thing to work around by opening the sandbox: the sandbox is the point.
+
+The way through is the one channel that already works. Codex runs its *hooks*
+itself, in its own process, outside that sandbox — which is exactly why status
+keeps arriving from a session whose own `curl` cannot leave the ground — and a
+`PreToolUse` hook is handed the command the model was about to run. So the
+model writes what it wants as a shell no-op:
+
+```bash
+: marol-peers
+: marol-send <the id> <the message>
+```
+
+Nothing executes those; the leading colon is the shell's no-op. Marol reads
+the line out of the hook it already receives for every command, does the work,
+and answers in that hook's own `additionalContext`, which Codex records on the
+conversation. One road in, one road out, neither of them a socket the model
+was denied.
+
+Below the door it is the same code: the same queue, the same envelope, the
+same relay ceiling. What differs is only how the ask arrived — and with it the
+authentication, because there is no per-session token on this road. There does
+not need to be: the caller is Codex's own hook process, which reached the
+listener using the secret in the hook URL, and anything able to forge that
+could already forge status.
 
 **Each CLI learns it through its own door.** Claude Code reads a skill out of
 the plugin `--plugin-dir` carries. Codex has no per-launch equivalent — its

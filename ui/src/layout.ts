@@ -99,7 +99,19 @@ export function sameLayout(a: Layout, b: Layout): boolean {
   return formatLayout(a) === formatLayout(b);
 }
 
-const clampCols = (n: unknown) => Math.min(6, Math.max(1, Math.floor(Number(n)) || 1));
+/**
+ * A stored column count, made sane.
+ *
+ * The ceiling is storage hygiene and nothing else: what actually gets drawn
+ * is `autoCols`, which never returns more columns than there are panes, so a
+ * choice larger than the wall is already indistinguishable from the wall's
+ * own width. The number here only has to reject a corrupt row — a negative, a
+ * NaN, a value no desk could have chosen — without ever being the thing
+ * somebody bumps into. Six used to be that number and was the wrong kind of
+ * limit: it was smaller than a wall of terminals can plausibly be, so it
+ * capped a real choice rather than a bad row.
+ */
+const clampCols = (n: unknown) => Math.min(64, Math.max(1, Math.floor(Number(n)) || 1));
 
 /** Reject anything that would make the renderer misbehave. */
 function sanitize(n: unknown): Node | null {

@@ -164,8 +164,24 @@ pub fn send_url(hook_url: &str, session_id: &str, token: &str) -> String {
 }
 
 /// What arrived on the listener.
+/// What a sandboxed session is asking the desk to do on its behalf.
+///
+/// The same two things `Incoming::Peers` and `Incoming::Send` carry, arriving
+/// by a different road. See `parse_relay`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayAsk {
+    Peers,
+    Send { to: String, text: String },
+}
+
 pub enum Incoming {
     Status(HookReport),
+    /// A Codex session reaching the desk through its own `PreToolUse` hook,
+    /// because its sandbox will not let it reach the desk any other way.
+    Relay {
+        session_id: String,
+        ask: RelayAsk,
+    },
     Name(NameReport),
     /// A session asking what else is running on this desk.
     Peers { session_id: String, token: String },
@@ -207,6 +223,79 @@ pub trait HookHandler: Send + Sync + 'static {
     ) -> Result<(), String> {
         Err("this desk is not carrying messages".to_string())
     }
+
+    /// The same two asks, from a session that cannot open a socket.
+    ///
+    /// No per-session token, and that is not a hole: the caller here is not
+    /// the model but the CLI's own hook process, which reached this listener
+    /// using the secret in the hook URL. A model that could forge this could
+    /// already forge status — and the model this exists for is precisely the
+    /// one whose sandbox denies it a socket at all.
+    ///
+    /// Returns the sentence to hand back to the model.
+    fn on_relay(&self, _session_id: &str, _ask: &RelayAsk) -> String {
+        String::new()
+    }
+}
+
+/// The marker a sandboxed session writes instead of making a request.
+///
+/// Written as a shell no-op — `: marol-send …` — so that whatever the desk
+/// makes of the line, the sandbox executes nothing. It is a signal, and the
+/// only thing that must be true of it is that running it is harmless.
+pub const PEERS_MARKER: &str = "marol-peers";
+pub const SEND_MARKER: &str = "marol-send";
+
+/// Read one of those lines, or `None` for an ordinary command.
+///
+/// Deliberately forgiving about quoting. The desk sees the command as the
+/// model wrote it, before any shell has touched it, so there is no expansion
+/// to undo and nothing is gained by demanding a particular spelling — one
+/// layer of matched quotes comes off and the rest is the message, verbatim.
+pub fn parse_relay(command: &str) -> Option<RelayAsk> {
+    let trimmed = command.trim();
+    let line = trimmed.strip_prefix(':').unwrap_or(trimmed).trim_start();
+    // The marker is compared as a whole word, not as a prefix: `marol-sender`
+    // starts with `marol-send` and is somebody else's program.
+    let (word, rest) = match line.split_once(char::is_whitespace) {
+        Some((w, r)) => (w, r.trim_start()),
+        None => (line, ""),
+    };
+    match word {
+        PEERS_MARKER => rest.is_empty().then_some(RelayAsk::Peers),
+        SEND_MARKER => {
+            let (to, text) = rest.split_once(char::is_whitespace)?;
+            let text = unquote(text.trim());
+            (!to.is_empty() && !text.is_empty()).then(|| RelayAsk::Send {
+                to: to.to_string(),
+                text,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn unquote(s: &str) -> String {
+    let b = s.as_bytes();
+    if b.len() >= 2 && matches!(b[0], b'\'' | b'"') && b[b.len() - 1] == b[0] {
+        return s[1..s.len() - 1].to_string();
+    }
+    s.to_string()
+}
+
+/// A `PreToolUse` answer that says something to the model.
+///
+/// The command is allowed to run — it is `:`, which does nothing — because a
+/// denial would read to the model as a refusal when what actually happened is
+/// that the desk did the thing.
+fn relay_reply(context: &str) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": context,
+        }
+    })
+    .to_string()
 }
 
 pub struct HookServer {
@@ -392,6 +481,13 @@ async fn serve(mut stream: tokio::net::TcpStream, want_prefix: &str, handler: Ar
             handler.on_name(report);
             ("200 OK", String::new())
         }
+        // Answered in the shape a `PreToolUse` hook's stdout is read as, so
+        // the reply lands in the model's own context. This is the only hook
+        // whose body is kept rather than discarded — see `codex_command`.
+        Some(Incoming::Relay { session_id, ask }) => (
+            "200 OK",
+            relay_reply(&handler.on_relay(&session_id, &ask)),
+        ),
         Some(Incoming::Peers { session_id, token }) => match handler.on_peers(&session_id, &token) {
             Some(list) => ("200 OK", list),
             None => ("403 Forbidden", "not this session's token\n".to_string()),
@@ -569,6 +665,24 @@ async fn read_request(
     }
 
     let payload = serde_json::from_slice::<serde_json::Value>(&body).ok();
+
+    // A sandboxed session's only way out. Codex runs its hooks itself, in its
+    // own process, outside the sandbox it puts the model's shell in — so the
+    // command the model was about to run reaches the desk even though the
+    // model could not have sent it here. Read before the status report is
+    // built because it is not one: nothing about the agent's state changed,
+    // it asked the desk for something.
+    if let Some(ask) = payload
+        .as_ref()
+        .and_then(|v| v.get("tool_input"))
+        .and_then(|v| v.get("command"))
+        .and_then(|v| v.as_str())
+        .and_then(parse_relay)
+    {
+        let session_id = session_id.clone().filter(|s| expanded(s))?;
+        return Some(Incoming::Relay { session_id, ask });
+    }
+
     let activity = payload.as_ref().and_then(activity_from_payload);
     let str_field = |key: &str| {
         payload
@@ -815,7 +929,7 @@ fn dq_escape(s: &str) -> String {
 /// change, this stops teaching and nothing else breaks — the report still
 /// goes, the session still runs, and a Codex agent is simply back to not
 /// knowing about the channel.
-const CODEX_PEERS_CONTEXT: &str = "You are running in a Marol window beside other agent sessions, which may be a different CLI. `curl -sS --max-time 3 \"$MAROL_PEERS_URL\"` lists them, one per line, as id<TAB>name<TAB>status. To send one a message: `curl -sS --max-time 3 -X POST \"$MAROL_SEND_URL\" -H \"X-Marol-To: <the id>\" --data-binary \"your message\"`. Use both variables exactly as they are; each already carries this session identity. The message arrives in that session terminal marked as coming from you and explicitly not from the person, so send facts, findings and warnings — another agent cannot approve anything on the person behalf, and neither can you. If either variable is unset, this session is not wired for it: do nothing and do not mention it. Use this when work here depends on, blocks, or duplicates work another session is doing, not to chat. Messages are counted by how far they have travelled from the last thing a person said, and past a few hops the desk refuses to carry one and says so — that is not a limit to work around: ask the person at the keyboard, whose reply clears the count.";
+const CODEX_PEERS_CONTEXT: &str = "You are running in a Marol window beside other agent sessions, which may be a different CLI. To see them, run the shell command `: marol-peers`. To send one a message, run `: marol-send <the id> <your message>`. These are not real commands and nothing executes them — the leading colon is the shell no-op, so the line does nothing at all where you run it. Marol reads it out of the hook it already receives for every command you run, does the work outside your sandbox, and hands the answer back to you as context on this conversation. That indirection is the point: your sandbox denies you network sockets, so a curl to Marol cannot work and would report the desk as down when it is not. The message arrives in that session terminal marked as coming from you and explicitly not from the person, so send facts, findings and warnings — another agent cannot approve anything on the person behalf, and neither can you. Use this when work here depends on, blocks, or duplicates work another session is doing, not to chat. Messages are counted by how far they have travelled from the last thing a person said, and past a few hops the desk refuses to carry one and says so — that is not a limit to work around: ask the person at the keyboard, whose reply clears the count.";
 
 /// The `SessionStart` hook: report the session, then tell it about the desk.
 ///
@@ -838,14 +952,21 @@ fn codex_session_start_command(url: &str, max_time: u32) -> String {
     format!(
         "printf %s \"{}\"; {}",
         dq_escape(&payload),
-        codex_command(url, "started", max_time)
+        codex_command(url, "started", max_time, false)
     )
 }
 
-fn codex_command(url: &str, state: &str, max_time: u32) -> String {
+fn codex_command(url: &str, state: &str, max_time: u32, keep_reply: bool) -> String {
+    // Every other hook throws the response away: it is a report, the desk has
+    // nothing to say back, and stdout from a hook is parsed as a decision
+    // about the tool call. `PreToolUse` is the exception, because it is the
+    // road a sandboxed session asks the desk for something on, and the answer
+    // has to reach the model. An ordinary tool call gets an empty body, which
+    // parses as no output and changes nothing.
+    let sink = if keep_reply { "" } else { " -o /dev/null" };
     format!(
         "curl -sS --max-time {max_time} -X POST -H content-type:application/json \
-         --data-binary @- \"{url}?sid=$MAROL_SESSION_ID&state={state}\" -o /dev/null || exit 0"
+         --data-binary @- \"{url}?sid=$MAROL_SESSION_ID&state={state}\"{sink} || exit 0"
     )
 }
 
@@ -890,7 +1011,7 @@ pub fn codex_config_args(url: &str) -> Vec<String> {
         let command = if event == "SessionStart" {
             codex_session_start_command(url, max_time)
         } else {
-            codex_command(url, state, max_time)
+            codex_command(url, state, max_time, event == "PreToolUse")
         };
         out.push("-c".to_string());
         out.push(format!(
@@ -1092,6 +1213,90 @@ fn write_plugin(dir: &Path, url: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The shape a sandboxed session writes, and what is read back out of it.
+    ///
+    /// Forgiving on purpose: the desk sees the line as the model typed it,
+    /// before any shell has touched it, so there is no expansion to undo and
+    /// nothing is bought by insisting on one spelling.
+    #[test]
+    fn a_relay_line_is_read_however_it_was_quoted() {
+        use super::{parse_relay, RelayAsk};
+        assert_eq!(parse_relay(": marol-peers"), Some(RelayAsk::Peers));
+        assert_eq!(parse_relay("marol-peers"), Some(RelayAsk::Peers));
+        assert_eq!(parse_relay("  :   marol-peers  "), Some(RelayAsk::Peers));
+
+        let sent = |to: &str, text: &str| {
+            Some(RelayAsk::Send {
+                to: to.to_string(),
+                text: text.to_string(),
+            })
+        };
+        assert_eq!(parse_relay(": marol-send s1 hello there"), sent("s1", "hello there"));
+        assert_eq!(parse_relay(": marol-send s1 'hello there'"), sent("s1", "hello there"));
+        assert_eq!(parse_relay(": marol-send s1 \"hello there\""), sent("s1", "hello there"));
+        // Only the outermost pair comes off — an apostrophe inside a sentence
+        // is part of the sentence.
+        assert_eq!(
+            parse_relay(": marol-send s1 'it's fine'"),
+            sent("s1", "it's fine")
+        );
+    }
+
+    /// An ordinary command is an ordinary command. This runs on every tool
+    /// call a Codex session makes, so a loose match here would turn somebody's
+    /// `git commit -m \"marol-send ...\"` into a message.
+    #[test]
+    fn an_ordinary_command_is_not_mistaken_for_a_relay() {
+        use super::parse_relay;
+        for line in [
+            "ls -la",
+            "git commit -m 'marol-send s1 hi'",
+            "echo marol-peers",
+            ": marol-peers extra",
+            ": marol-send s1",
+            ": marol-sender s1 hi",
+            "",
+        ] {
+            assert!(parse_relay(line).is_none(), "read as a relay: {line:?}");
+        }
+    }
+
+    /// The reply has to be the shape Codex parses a `PreToolUse` hook's
+    /// stdout as, or the answer never reaches the model and the session is
+    /// left believing the desk said nothing.
+    #[test]
+    fn the_reply_is_shaped_the_way_a_pretooluse_hook_is_read() {
+        let v: serde_json::Value =
+            serde_json::from_str(&super::relay_reply("delivered")).expect("valid json");
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(v["hookSpecificOutput"]["additionalContext"], "delivered");
+    }
+
+    /// Every other hook throws its response away, because stdout from a hook
+    /// is read as a decision about the tool call. `PreToolUse` is the one
+    /// that must not, because it is the road the answer comes back on.
+    #[test]
+    fn only_the_pretooluse_hook_keeps_what_the_desk_says() {
+        let args = super::codex_config_args("http://127.0.0.1:1/h/t");
+        let line = |event: &str| {
+            args.iter()
+                .find(|a| a.starts_with(&format!("hooks.{event}=")))
+                .unwrap_or_else(|| panic!("no {event} hook"))
+                .clone()
+        };
+        assert!(
+            !line("PreToolUse").contains("-o /dev/null"),
+            "the one reply channel was discarded: {}",
+            line("PreToolUse")
+        );
+        for event in ["UserPromptSubmit", "Stop", "SessionEnd"] {
+            assert!(
+                line(event).contains("-o /dev/null"),
+                "{event} keeps a body it cannot use"
+            );
+        }
+    }
     use super::*;
     use serde_json::json;
 
@@ -1557,11 +1762,22 @@ mod tests {
             .as_str()
             .expect("an additionalContext string");
 
-        // It names the variables rather than carrying their values. A shell
-        // that expanded them would put this session's token into the model's
+        // It teaches the road that works from inside Codex's sandbox. The
+        // URLs are still exported for a session running without one, but a
+        // context that named them would have the sandboxed majority spend a
+        // turn on a `curl` that cannot leave `socket()`, and then report this
+        // desk as down.
+        assert!(context.contains(": marol-peers"), "{context}");
+        assert!(context.contains(": marol-send"), "{context}");
+        // It may *mention* curl — it explains why one cannot work — but it
+        // must not hand over a URL to point one at.
+        assert!(
+            !context.contains("MAROL_SEND_URL") && !context.contains("MAROL_PEERS_URL"),
+            "the context still points at a socket: {context}"
+        );
+        // Nothing secret rides along, whichever road is taught: a shell that
+        // expanded a URL would put this session's token into the model's
         // context and into the transcript on disk.
-        assert!(context.contains("$MAROL_PEERS_URL"), "{context}");
-        assert!(context.contains("$MAROL_SEND_URL"), "{context}");
         assert!(!context.contains("&tok="), "a token reached the context: {context}");
         assert!(!context.contains(URL), "the listener URL reached the context: {context}");
         // And it carries the one clause that keeps a peer from borrowing the

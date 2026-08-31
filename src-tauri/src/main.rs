@@ -301,6 +301,10 @@ fn boot_status(state: State<'_, AppState>) -> serde_json::Value {
                 "spawned": t.spawned,
                 "lost": t.lost,
             })).collect::<Vec<_>>(),
+            // What this run's update pass did to each world's agent CLIs.
+            // Empty until a world has been reached, and empty forever in a
+            // desk that has the pass switched off.
+            "agentUpdates": c.agent_updates(),
             "db": store::default_path().to_string_lossy(),
             "hookUrl": c.hook_url(),
             // The one text this desk puts into a session on its own. Naming
@@ -1097,6 +1101,21 @@ fn set_checkpoints_enabled(state: State<'_, AppState>, on: bool) -> StdResult<()
         .map_err(|e| format!("{e:#}"))
 }
 
+/* ------------------------- agent updates -------------------------- */
+
+#[tauri::command]
+fn agent_updates_enabled(state: State<'_, AppState>) -> StdResult<bool, String> {
+    Ok(state.core()?.agent_updates_on())
+}
+
+#[tauri::command]
+fn set_agent_updates_enabled(state: State<'_, AppState>, on: bool) -> StdResult<(), String> {
+    state
+        .core()?
+        .set_agent_updates_on(on)
+        .map_err(|e| format!("{e:#}"))
+}
+
 /// The manual snapshot button. `None` means the worktree matches the last
 /// checkpoint already — nothing new to keep.
 #[tauri::command]
@@ -1286,6 +1305,8 @@ fn main() {
             test_notification,
             checkpoints_enabled,
             set_checkpoints_enabled,
+            agent_updates_enabled,
+            set_agent_updates_enabled,
             checkpoint_now,
             list_checkpoints,
             restore_checkpoint,
@@ -1369,6 +1390,8 @@ mod tests {
             ("test_notification", "hands one line to the OS notifier"),
             ("checkpoints_enabled", "SQLite"),
             ("set_checkpoints_enabled", "SQLite"),
+            ("agent_updates_enabled", "in-memory"),
+            ("set_agent_updates_enabled", "SQLite"),
             ("set_update_enabled", "SQLite"),
         ];
 

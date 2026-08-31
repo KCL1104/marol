@@ -250,6 +250,17 @@ export interface BootStatus {
       came. Declining is silent by design, so a world where the channel never
       opens looks exactly like a working one until these say otherwise. */
   channels?: { world: string; held: number; spawned: number; lost: number }[];
+  /** What this run's agent-update pass did, one row per CLI per world it
+      reached. Empty until a world has been opened, and empty for good on a
+      desk with the pass switched off. */
+  agentUpdates?: {
+    world: string;
+    agent: string;
+    from: string | null;
+    to: string | null;
+    outcome: 'updated' | 'current' | 'failed';
+    detail: string;
+  }[];
   db?: string;
   hookUrl?: string | null;
   /** The opening-prompt template on disk — the one text this desk adds to a

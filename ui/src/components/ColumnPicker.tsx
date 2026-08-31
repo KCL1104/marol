@@ -1,8 +1,6 @@
 import { useT } from '../i18n';
 import type { Layout } from '../layout';
 
-const COUNTS = [1, 2, 3];
-
 /**
  * Column count for auto mode, and the way back out of a hand-built layout.
  *
@@ -10,17 +8,35 @@ const COUNTS = [1, 2, 3];
  * tab an explicit split tree, and exists so the control still describes what
  * you are looking at. Choosing anything else discards the tree, which is the
  * only undo a hand-built layout has.
+ *
+ * The list runs to however many panes are on the wall, rather than to a fixed
+ * three. Three was a number with nothing behind it: `autoCols` already
+ * refuses to draw more columns than there are panes, so one column per pane
+ * — a single row, everything side by side — is the widest arrangement that
+ * can differ from any other, and it was unreachable for anybody with four
+ * terminals open. Past that the options would be identical to each other,
+ * which is not more choice, only a longer list.
  */
 export function ColumnPicker({
   layout,
+  panes,
   onPick,
 }: {
   layout: Layout;
+  /** How many panes the tab is showing — the point past which another
+   *  column changes nothing. */
+  panes: number;
   onPick: (value: 'auto' | number) => void;
 }) {
   const t = useT();
   const manual = layout.mode === 'manual';
   const value = manual ? 'manual' : String(layout.cols);
+  // At least three, so an empty or nearly empty wall keeps the choices it has
+  // always had; and never fewer than the count already chosen, or picking 8
+  // and then closing a session would leave the select describing a value it
+  // no longer offers.
+  const most = Math.max(3, panes, manual || layout.cols === 'auto' ? 0 : layout.cols);
+  const COUNTS = Array.from({ length: most }, (_, i) => i + 1);
 
   return (
     <label className="col-picker">

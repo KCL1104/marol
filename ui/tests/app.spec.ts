@@ -221,3 +221,66 @@ test.describe('terminal rendering', () => {
     expect((await screenText(page)).length).toBe(before);
   });
 });
+
+/**
+ * How wide the wall may be.
+ *
+ * The count used to stop at three, which was a constant with nothing behind
+ * it: the model has always drawn as many columns as it was given, and the
+ * renderer bounds that by the number of panes rather than by any number of
+ * ours. So the list runs to one column per pane — the widest arrangement
+ * that can differ from any other — and the person decides where in it to sit.
+ */
+test.describe('how many columns', () => {
+  const options = (page: Page) =>
+    page.getByTestId('col-picker').locator('option').allTextContents();
+
+  test('the choices grow with the wall, past the old three', async ({ page }) => {
+    await boot(page);
+    for (const n of ['one', 'two', 'three', 'four', 'five']) {
+      await newSession(page, `/Users/test/repo-${n}`);
+    }
+    await expect(page.locator('.pane')).toHaveCount(5);
+
+    const offered = await options(page);
+    expect(offered).toContain('5 欄');
+    expect(offered).toContain('4 欄');
+    // And nothing beyond the wall: a sixth column with five panes draws the
+    // same five, so offering it would be a longer list, not more choice.
+    expect(offered).not.toContain('6 欄');
+  });
+
+  test('a wall of five can actually be laid out five across', async ({ page }) => {
+    await boot(page);
+    for (const n of ['one', 'two', 'three', 'four', 'five']) {
+      await newSession(page, `/Users/test/repo-${n}`);
+    }
+    await page.getByTestId('col-picker').selectOption('5');
+
+    // The desk's own declaration of the count...
+    await expect(page.locator('.term-stack')).toHaveAttribute('data-cols', '5');
+    // ...and the grid it actually built from it, five tracks across one row.
+    const tracks = await page
+      .locator('.term-grid')
+      .evaluate((el) => getComputedStyle(el).gridTemplateColumns.split(' ').length);
+    expect(tracks).toBe(5);
+  });
+
+  test('the choice survives a reload, and the picker still offers it', async ({ page }) => {
+    await boot(page);
+    for (const n of ['one', 'two', 'three', 'four']) {
+      await newSession(page, `/Users/test/repo-${n}`);
+    }
+    await page.getByTestId('col-picker').selectOption('4');
+    await page.reload();
+    await expect(page.locator('.pane')).toHaveCount(4);
+    await expect(page.getByTestId('col-picker')).toHaveValue('4');
+  });
+
+  /** An empty desk keeps the choices it always had rather than collapsing to
+      one, so the control does not change shape underneath somebody. */
+  test('an empty wall still offers three', async ({ page }) => {
+    await boot(page);
+    expect(await options(page)).toContain('3 欄');
+  });
+});

@@ -614,6 +614,26 @@ impl Versions {
     }
 }
 
+/// What came of bringing one CLI in one world up to date.
+///
+/// Decided by measuring, not by reading: the version is probed before and
+/// after, and the two numbers are the answer. Both CLIs report success in
+/// their own words and those words have changed before — the whole reason
+/// `agent-parity.yml` exists is that a table of somebody else's wording rots
+/// silently — so nothing here parses English.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentUpdate {
+    /// `wsl:Ubuntu`, or `local`.
+    pub world: String,
+    pub agent: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    /// `updated`, `current`, or `failed`.
+    pub outcome: &'static str,
+    /// Why, when it failed. Empty otherwise.
+    pub detail: String,
+}
+
 /// One repository's setup script, waiting to wrap a launch. See
 /// `Core::launch`.
 struct SetupWrap {
@@ -852,6 +872,10 @@ const NOTIFY_PREFS_KEY: &str = "notify_prefs";
 /// agent run affordable. The environment panel can turn it off.
 const CHECKPOINTS_KEY: &str = "checkpoints_on";
 
+/// Whether the agent CLIs are brought up to date when a world is first
+/// reached. Absent means the default, which is on.
+const AGENT_UPDATES_KEY: &str = "agent_updates_on";
+
 struct Router {
     sink: Arc<dyn UiSink>,
     /// The same cell the core holds, so a notification never has to upgrade
@@ -909,6 +933,115 @@ impl Router {
         }
         self.sink
             .emit("badge", serde_json::json!({ "count": waiting }));
+    }
+
+    /// The peer listing, with no opinion about how the asker got here.
+    ///
+    /// Split from `on_peers` because there are two doors now and only one
+    /// of them carries a per-session token — see `on_relay`.
+    fn peers_of(&self, session_id: &str) -> Option<String> {
+        self.sessions.lock().unwrap().get(session_id)?;
+        let sessions = self.sessions.lock().unwrap();
+        let mut rows: Vec<String> = sessions
+            .values()
+            .filter(|s| s.id != session_id && s.live && s.agent_session)
+            .map(|s| format!("{}\t{}\t{}", s.id, s.title, status_name(s.status)))
+            .collect();
+        rows.sort();
+        Some(rows.join("\n") + if rows.is_empty() { "" } else { "\n" })
+    }
+
+    /// Put one session's message on another's queue.
+    ///
+    /// `Ok` carries the target's name, because one of the two doors has
+    /// to say who actually got it: an agent that cannot see an HTTP
+    /// status needs the sentence to be the whole answer.
+    fn deliver_peer(&self, session_id: &str, to: &str, text: &str) -> Result<String, String> {
+        if text.trim().is_empty() {
+            return Err("there was no message to carry".to_string());
+        }
+        if session_id == to {
+            return Err("a session cannot message itself".to_string());
+        }
+        let (from, hops, target_idle) = {
+            let sessions = self.sessions.lock().unwrap();
+            let sender = sessions
+                .get(session_id)
+                .ok_or_else(|| "the sending session is not on this desk".to_string())?;
+            let (from, hops) = (sender.title.clone(), sender.relay_hops + 1);
+            let target = sessions
+                .get(to)
+                .ok_or_else(|| format!("no session here with id {to}"))?;
+            if !target.live {
+                return Err(format!("「{}」 has no terminal any more", target.title));
+            }
+            (
+                from,
+                hops,
+                !matches!(target.status, Status::Running | Status::Starting),
+            )
+        };
+        // The brake. Refused before anything is queued or recorded, because a
+        // chain this long is not a message to hold for later — it is one that
+        // should not be sent at all, and saying so while the sender is still
+        // in its own turn is what lets it do something else instead.
+        if hops > MAX_RELAY_HOPS {
+            // Said on the card as well as to the sender. The agent will do
+            // something with the refusal, but what it does is its own turn's
+            // business; the person watching the board is the one who can
+            // actually end the deadlock, and they will not read the agent's
+            // transcript to find out that it wants them.
+            {
+                let mut sessions = self.sessions.lock().unwrap();
+                let to_title = sessions.get(to).map(|s| s.title.clone()).unwrap_or_default();
+                if let Some(sender) = sessions.get_mut(session_id) {
+                    sender.activity = Some(Activity {
+                        tool: "SendMessage".to_string(),
+                        detail: format!("→ {to_title}: held back, {hops} relays from a person"),
+                    });
+                    sender.activity_since = now_ms();
+                }
+            }
+            self.broadcast();
+            return Err(format!(
+                "this would be relay {hops} since a person last said anything, and this desk \
+                 stops at {MAX_RELAY_HOPS} — ask the person at the keyboard rather than \
+                 another agent. Anyone typing into either terminal clears the count."
+            ));
+        }
+        let core = self
+            .core
+            .get()
+            .and_then(|w| w.upgrade())
+            .ok_or_else(|| "this desk is shutting down".to_string())?;
+        core.enqueue_followup(to, text, Some(from), hops)
+            .map_err(|e| format!("{e:#}"))?;
+
+        // What the sender is doing, said the way the board already says it.
+        // A session posting to this endpoint is inside a shell tool, so its
+        // own PreToolUse reported `Bash` with a curl line — true, and useless
+        // on a card about which agents are talking to each other. Rewritten
+        // into the arrow shape `activity_from_payload` already gives Claude
+        // Code's own SendMessage, so the two channels read alike.
+        let to_title = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let to_title = sessions.get(to).map(|s| s.title.clone()).unwrap_or_default();
+            if let Some(sender) = sessions.get_mut(session_id) {
+                let what: String = text.chars().take(120).collect();
+                sender.activity = Some(Activity {
+                    tool: "SendMessage".to_string(),
+                    detail: format!("→ {to_title}: {what}").chars().take(160).collect(),
+                });
+                sender.activity_since = now_ms();
+            }
+            to_title
+        };
+        self.broadcast();
+
+        if target_idle {
+            core.flush_followup(to);
+        }
+        Ok(to_title)
     }
 }
 
@@ -1155,14 +1288,7 @@ impl HookHandler for Router {
         if !self.token_ok(session_id, token) {
             return None;
         }
-        let sessions = self.sessions.lock().unwrap();
-        let mut rows: Vec<String> = sessions
-            .values()
-            .filter(|s| s.id != session_id && s.live && s.agent_session)
-            .map(|s| format!("{}\t{}\t{}", s.id, s.title, status_name(s.status)))
-            .collect();
-        rows.sort();
-        Some(rows.join("\n") + if rows.is_empty() { "" } else { "\n" })
+        self.peers_of(session_id)
     }
 
     /// One session writing to another.
@@ -1180,87 +1306,43 @@ impl HookHandler for Router {
         if !self.token_ok(session_id, token) {
             return Err("not this session's token".to_string());
         }
-        if session_id == to {
-            return Err("a session cannot message itself".to_string());
-        }
-        let (from, hops, target_idle) = {
-            let sessions = self.sessions.lock().unwrap();
-            let sender = sessions
-                .get(session_id)
-                .ok_or_else(|| "the sending session is not on this desk".to_string())?;
-            let (from, hops) = (sender.title.clone(), sender.relay_hops + 1);
-            let target = sessions
-                .get(to)
-                .ok_or_else(|| format!("no session here with id {to}"))?;
-            if !target.live {
-                return Err(format!("「{}」 has no terminal any more", target.title));
-            }
-            (
-                from,
-                hops,
-                !matches!(target.status, Status::Running | Status::Starting),
-            )
-        };
-        // The brake. Refused before anything is queued or recorded, because a
-        // chain this long is not a message to hold for later — it is one that
-        // should not be sent at all, and saying so while the sender is still
-        // in its own turn is what lets it do something else instead.
-        if hops > MAX_RELAY_HOPS {
-            // Said on the card as well as to the sender. The agent will do
-            // something with the refusal, but what it does is its own turn's
-            // business; the person watching the board is the one who can
-            // actually end the deadlock, and they will not read the agent's
-            // transcript to find out that it wants them.
-            {
-                let mut sessions = self.sessions.lock().unwrap();
-                let to_title = sessions.get(to).map(|s| s.title.clone()).unwrap_or_default();
-                if let Some(sender) = sessions.get_mut(session_id) {
-                    sender.activity = Some(Activity {
-                        tool: "SendMessage".to_string(),
-                        detail: format!("→ {to_title}: held back, {hops} relays from a person"),
-                    });
-                    sender.activity_since = now_ms();
+        self.deliver_peer(session_id, to, text).map(|_| ())
+    }
+
+    /// The same two asks, from a session that cannot open a socket.
+    ///
+    /// Codex sandboxes the shell it gives the model and denies it every
+    /// socket family but `AF_UNIX`, so the `curl` the skill describes
+    /// cannot be made at all — it fails inside `socket()`, and the model,
+    /// seeing a connection error, reports the desk as down. But Codex runs
+    /// its *hooks* itself, outside that sandbox, and a `PreToolUse` hook
+    /// is handed the command the model was about to run. So the model
+    /// writes what it wants as a shell no-op, and the hook — which can
+    /// reach us — carries it. The reply goes back as that hook's own
+    /// `additionalContext`, which Codex records on the conversation.
+    ///
+    /// No per-session token here, and that is not a hole: the caller is
+    /// the CLI's hook process, which reached this listener with the secret
+    /// in the hook URL. Anything able to forge this could already forge
+    /// status — and the model this exists for cannot open a socket.
+    fn on_relay(&self, session_id: &str, ask: &hooks::RelayAsk) -> String {
+        match ask {
+            hooks::RelayAsk::Peers => match self.peers_of(session_id) {
+                None => "[marol] This session is not on this desk any more.".to_string(),
+                Some(list) if list.trim().is_empty() => {
+                    "[marol] No other agent sessions are running on this desk.".to_string()
+                }
+                Some(list) => {
+                    format!("[marol] On this desk, as id<TAB>name<TAB>status:\n{list}")
+                }
+            },
+            hooks::RelayAsk::Send { to, text } => {
+                match self.deliver_peer(session_id, to, text) {
+                    Ok(name) => format!("[marol] Delivered to 「{name}」."),
+                    Err(why) => format!("[marol] Not delivered: {why}"),
                 }
             }
-            self.broadcast();
-            return Err(format!(
-                "this would be relay {hops} since a person last said anything, and this desk \
-                 stops at {MAX_RELAY_HOPS} — ask the person at the keyboard rather than \
-                 another agent. Anyone typing into either terminal clears the count."
-            ));
         }
-        let core = self
-            .core
-            .get()
-            .and_then(|w| w.upgrade())
-            .ok_or_else(|| "this desk is shutting down".to_string())?;
-        core.enqueue_followup(to, text, Some(from), hops)
-            .map_err(|e| format!("{e:#}"))?;
-
-        // What the sender is doing, said the way the board already says it.
-        // A session posting to this endpoint is inside a shell tool, so its
-        // own PreToolUse reported `Bash` with a curl line — true, and useless
-        // on a card about which agents are talking to each other. Rewritten
-        // into the arrow shape `activity_from_payload` already gives Claude
-        // Code's own SendMessage, so the two channels read alike.
-        {
-            let mut sessions = self.sessions.lock().unwrap();
-            let to_title = sessions.get(to).map(|s| s.title.clone()).unwrap_or_default();
-            if let Some(sender) = sessions.get_mut(session_id) {
-                let what: String = text.chars().take(120).collect();
-                sender.activity = Some(Activity {
-                    tool: "SendMessage".to_string(),
-                    detail: format!("→ {to_title}: {what}").chars().take(160).collect(),
-                });
-                sender.activity_since = now_ms();
-            }
-        }
-        self.broadcast();
-
-        if target_idle {
-            core.flush_followup(to);
-        }
-        Ok(())
     }
 
     /// A session saying what it should be called.
@@ -1389,6 +1471,12 @@ pub struct Core {
     /// Whether the end of a turn snapshots the worktree (see
     /// `CHECKPOINTS_KEY`).
     checkpoints_on: Mutex<bool>,
+    /// Whether a world's agent CLIs are updated when it is first reached
+    /// (`AGENT_UPDATES_KEY`).
+    agent_updates_on: Mutex<bool>,
+    /// What the last such pass did, newest world last. Read by the panel;
+    /// never stored, because it describes this run of the app.
+    agent_updates: Arc<Mutex<Vec<AgentUpdate>>>,
     /// Attempts with a snapshot in flight. Two Stops racing — or a manual
     /// click during one — would compute the same ordinal and fight over the
     /// temp index; the second caller finds the flag and leaves.
@@ -1555,7 +1643,13 @@ pub struct HostEnv {
     /// This world's CLIs, not ours. A WSL distro has its own claude and its
     /// own codex, at its own versions, and the flags a launch may use are
     /// decided by the binary that will actually run.
-    pub versions: Versions,
+    ///
+    /// Behind a lock because a CLI can now change underneath a running desk:
+    /// the agents are updated on the way in, and a launch after that has to
+    /// be gated on the binary it will actually get rather than on the one
+    /// probed a moment before the upgrade. Stale in the safe direction is
+    /// still a session that passes a flag the new CLI renamed.
+    versions: Mutex<Versions>,
     /// `~/.marol/worktrees` *inside the host* — a worktree lives in the
     /// same filesystem as its repository, never across a boundary.
     pub worktree_root: String,
@@ -1667,6 +1761,11 @@ struct HoldPlan {
 }
 
 impl HostEnv {
+    /// This world's CLI versions as last known.
+    pub fn versions(&self) -> Versions {
+        *self.versions.lock().unwrap()
+    }
+
     /// The pair of environments everything that executes needs.
     fn hr<'a>(&'a self, local: &'a ShellEnv) -> HostRef<'a> {
         HostRef {
@@ -1779,6 +1878,14 @@ impl Core {
             .map(|raw| raw != "0")
             .unwrap_or(true);
 
+        let agent_updates_on = store
+            .setting(AGENT_UPDATES_KEY)
+            .ok()
+            .flatten()
+            .map(|raw| raw != "0")
+            .unwrap_or(true);
+        let agent_updates: Arc<Mutex<Vec<AgentUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+
         // Both at once: neither answer depends on the other, and a machine
         // with both installed should not pay for them one after the next on
         // the path to the first paint.
@@ -1824,6 +1931,8 @@ impl Core {
             followups: Mutex::new(HashMap::new()),
             hosts: Mutex::new(HashMap::new()),
             checkpoints_on: Mutex::new(checkpoints_on),
+            agent_updates_on: Mutex::new(agent_updates_on),
+            agent_updates: Arc::clone(&agent_updates),
             checkpointing: Mutex::new(std::collections::HashSet::new()),
             usage_state: Mutex::new(HashMap::new()),
             machine_id: OnceLock::new(),
@@ -1888,7 +1997,7 @@ impl Core {
             Host::Local => HostEnv {
                 host: Host::Local,
                 env: self.env.clone(),
-                versions: self.versions,
+                versions: Mutex::new(self.versions),
                 worktree_root: self.worktrees.local_root(),
                 hooks: self.hooks.get().map(|s| hooks::Wiring {
                     plugin_dir: s.plugin_dir.to_string_lossy().to_string(),
@@ -1964,7 +2073,7 @@ impl Core {
                 HostEnv {
                     host: h.clone(),
                     env,
-                    versions,
+                    versions: Mutex::new(versions),
                     worktree_root: format!("{home}/.marol/worktrees"),
                     hooks: wiring,
                     channels: crate::channel::Channels::new(),
@@ -1976,7 +2085,131 @@ impl Core {
             .lock()
             .unwrap()
             .insert(h.clone(), Arc::clone(&he));
+        self.update_agents(&he);
         Ok(he)
+    }
+
+    /// Bring this world's agent CLIs up to date, off the caller's thread.
+    ///
+    /// Once per world per run of the app, at the moment the world is first
+    /// reached — which for the worlds somebody actually uses is "when Marol
+    /// opens", and for the rest is never, because a distro nobody opened a
+    /// card in should not be touched.
+    ///
+    /// **The command is theirs, not ours.** `claude update` and `codex update`
+    /// each work out how that copy was installed and run that method's
+    /// upgrade. Doing it here instead would mean telling an npm global from a
+    /// native install from a Homebrew cask from an apt package — and being
+    /// wrong in the one way that matters, because `npm install -g` over a
+    /// native install does not replace it: it adds a second one and leaves
+    /// which `claude` runs to whichever directory PATH happens to name first.
+    ///
+    /// It is also the check. Neither CLI offers a look-without-touching mode
+    /// — Codex's takes no flags at all — so asking and getting are one
+    /// command, and one already current answers by saying so.
+    ///
+    /// Detached and nothing waits on it. A world is usable while its CLIs are
+    /// being updated, both of them install the new version *beside* the
+    /// running one and hand it to the next launch rather than to a session
+    /// already open, and an update that fails is a CLI at the version it
+    /// already had — which is the version the desk probed and gated on.
+    fn update_agents(&self, he: &Arc<HostEnv>) {
+        if !*self.agent_updates_on.lock().unwrap() {
+            return;
+        }
+        let (he, local) = (Arc::clone(he), self.env.clone());
+        let report = Arc::clone(&self.agent_updates);
+        std::thread::spawn(move || {
+            let world = host::label(&he.host).unwrap_or_else(|| "local".to_string());
+            let hr = HostRef {
+                host: &he.host,
+                local: &local,
+                env: &he.env,
+                channels: Some(&he.channels),
+            };
+            let probe = |exe: &str| {
+                hr.run_ok(exe, &["--version"], None)
+                    .ok()
+                    .and_then(|s| parse_version(&s))
+            };
+            let spell = |v: Option<(u64, u64, u64)>| v.map(|(a, b, c)| format!("{a}.{b}.{c}"));
+            for cli in [Cli::Claude, Cli::Codex] {
+                let name = cli.name();
+                let before = he.versions().of(cli);
+                // Not installed here is not a thing to fix. Installing a CLI
+                // on somebody's machine is a different act from updating one
+                // they chose to have, and only the second was asked for.
+                if before.is_none() {
+                    continue;
+                }
+                let ran = hr.run_with_env(name, &[crate::agent::UPDATE_SUBCOMMAND], None, &[]);
+                let after = probe(name);
+                // The versions are the answer, not the wording. Both CLIs
+                // report success in their own words, those words have changed
+                // before, and a desk that reads them would announce an update
+                // that did not happen the first time one of them rephrased.
+                let outcome = if after != before {
+                    "updated"
+                } else {
+                    match &ran {
+                        Ok(out) if out.status.success() => "current",
+                        _ => "failed",
+                    }
+                };
+                let detail = if outcome == "failed" {
+                    match &ran {
+                        Ok(out) => String::from_utf8_lossy(&out.stderr)
+                            .lines()
+                            .find(|l| !l.trim().is_empty())
+                            .unwrap_or("the update command reported an error")
+                            .chars()
+                            .take(200)
+                            .collect(),
+                        Err(e) => format!("{e:#}").chars().take(200).collect(),
+                    }
+                } else {
+                    String::new()
+                };
+                if outcome != "current" {
+                    eprintln!("[core] {world} {name}: {outcome} {detail}");
+                }
+                // Written back whatever happened, because the point of
+                // re-probing is the gate: a launch after this has to be
+                // decided by the binary it will get, and a desk still holding
+                // the number from before the upgrade is one passing a flag
+                // the new CLI may have renamed.
+                {
+                    let mut v = he.versions.lock().unwrap();
+                    match cli {
+                        Cli::Claude => v.claude = after,
+                        Cli::Codex => v.codex = after,
+                    }
+                }
+                report.lock().unwrap().push(AgentUpdate {
+                    world: world.clone(),
+                    agent: name.to_string(),
+                    from: spell(before),
+                    to: spell(after),
+                    outcome,
+                    detail,
+                });
+            }
+        });
+    }
+
+    /// What this run's update pass did, for the panel.
+    pub fn agent_updates(&self) -> Vec<AgentUpdate> {
+        self.agent_updates.lock().unwrap().clone()
+    }
+
+    pub fn agent_updates_on(&self) -> bool {
+        *self.agent_updates_on.lock().unwrap()
+    }
+
+    pub fn set_agent_updates_on(&self, on: bool) -> Result<()> {
+        *self.agent_updates_on.lock().unwrap() = on;
+        self.store
+            .set_setting(AGENT_UPDATES_KEY, if on { "1" } else { "0" })
     }
 
     /// What each world's held shells have actually done, for the panel.
@@ -3622,8 +3855,8 @@ impl Core {
         let spell = |v: Option<(u64, u64, u64)>| v.map(|(a, b, c)| format!("{a}.{b}.{c}"));
         match self.located(&raw) {
             Ok((_, he)) => WorldProbe {
-                claude: spell(he.versions.claude),
-                codex: spell(he.versions.codex),
+                claude: spell(he.versions().claude),
+                codex: spell(he.versions().codex),
                 error: None,
             },
             Err(e) => WorldProbe {
@@ -4541,7 +4774,7 @@ impl Core {
         // flag is the one failure a person cannot work around from inside
         // the terminal, because there is no terminal.
         let hook_args = match (cli, &he.hooks) {
-            (Some(cli), Some(wiring)) if cli.hooks_ok(he.versions.of(cli)) => cli.hook_args(wiring),
+            (Some(cli), Some(wiring)) if cli.hooks_ok(he.versions().of(cli)) => cli.hook_args(wiring),
             _ => Vec::new(),
         };
 
@@ -4562,7 +4795,7 @@ impl Core {
         // start on a flag it does not know. Codex has no equivalent, and is
         // handed nothing rather than a guess.
         let mut opts = opts;
-        if cli == Some(Cli::Claude) && he.versions.claude >= Some(NAMED_SESSIONS_SINCE) {
+        if cli == Some(Cli::Claude) && he.versions().claude >= Some(NAMED_SESSIONS_SINCE) {
             if let Some(title) = self.sessions.lock().unwrap().get(id).map(|s| s.title.clone()) {
                 opts.push("--name".to_string());
                 opts.push(title);

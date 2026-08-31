@@ -67,6 +67,22 @@ pub enum Ledger {
 /// exactly where a Codex session was before any of this.
 pub const CODEX_HOOKS_SINCE: (u64, u64, u64) = (0, 124, 0);
 
+/// What each CLI is told to update itself with.
+///
+/// Both spell it `update`, and both mean the same thing by it: work out how
+/// this copy was installed and run that install method's upgrade. That is
+/// the whole reason the command is theirs and not ours. A desk that tried to
+/// update them itself would have to tell an npm global from a native install
+/// from a Homebrew cask from an apt package — and then be wrong in the one
+/// way that matters, because `npm install -g` over a native install does not
+/// replace it, it adds a second one and leaves which `claude` runs to
+/// whichever directory PATH names first.
+///
+/// It is also the check. Neither offers a look-without-touching mode —
+/// Codex's `update` takes no flags at all — so "is there a new one" and
+/// "get it" are one command, and an already-current CLI answers by saying so.
+pub const UPDATE_SUBCOMMAND: &str = "update";
+
 impl Cli {
     /// Which CLI a launcher's resolved agent name is, or `None` for one
     /// whose conventions nobody has measured.

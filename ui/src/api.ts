@@ -249,6 +249,8 @@ export const api = {
   /** Whether the end of a turn snapshots the worktree. */
   checkpointsEnabled: () => invoke<boolean>('checkpoints_enabled'),
   setCheckpointsEnabled: (on: boolean) => invoke<void>('set_checkpoints_enabled', { on }),
+  agentUpdatesEnabled: () => invoke<boolean>('agent_updates_enabled'),
+  setAgentUpdatesEnabled: (on: boolean) => invoke<void>('set_agent_updates_enabled', { on }),
   /** The manual snapshot. Null when nothing changed since the last one. */
   checkpointNow: (attemptId: string) =>
     invoke<Checkpoint | null>('checkpoint_now', { attemptId }),
