@@ -93,3 +93,26 @@ export function wheelSequence(lines: number, applicationCursorKeys: boolean): st
   const intro = applicationCursorKeys ? '\x1bO' : '\x1b[';
   return (intro + (lines < 0 ? 'A' : 'B')).repeat(Math.abs(lines));
 }
+
+/**
+ * The same notch, for a pane `tmux` is holding.
+ *
+ * Alt+PageUp and Alt+PageDown, which Marol's own `tmux` config binds and
+ * nothing else does. `tmux` then decides what the notch means, because it is
+ * the only party that can: from the terminal's side a held pane is on the
+ * alternate screen from the moment `tmux` attaches, whatever the program
+ * inside is doing, so the cursor keys `wheelSequence` sends are right for a
+ * full-screen agent and wrong for an inline one — where they reach the
+ * composer and walk its prompt history instead of the conversation. The
+ * branch on `#{alternate_on}` lives in the config; this only has to deliver
+ * one keypress per line, which is the part `tmux` cannot do for us.
+ *
+ * One per line rather than one per notch, for the same reason the arithmetic
+ * is ours at all: the wheel should move what it is worth.
+ */
+export function tmuxScrollSequence(lines: number): string {
+  if (lines === 0) return '';
+  // CSI 5;3~ and CSI 6;3~ — PageUp/PageDown with the Alt modifier, in the
+  // form `tmux` reads as `M-PPage` and `M-NPage`.
+  return `\x1b[${lines < 0 ? 5 : 6};3~`.repeat(Math.abs(lines));
+}

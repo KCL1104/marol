@@ -67,6 +67,32 @@ pub struct Hold {
 pub const HOLD_SESSION: &str = "agent";
 
 /// What `-f` points at. Written every app start.
+/// The two keys this config does bind, and the reason `unbind-key -a` is not
+/// the last line any more.
+///
+/// A wheel notch over a held pane used to become a cursor key, on the theory
+/// that the alternate screen has no scrollback to move. That theory read the
+/// wrong program's state: it is `tmux` that is on the alternate screen, from
+/// the moment it attaches, and what the program *inside* it is doing is a
+/// separate question. When that program draws inline — which Codex does, its
+/// alternate screen being reserved for overlays — the conversation is in
+/// `tmux`'s own scrollback, an Up key cannot reach it, and the composer takes
+/// the key as a walk through prompt history instead. Which is what it looked
+/// like: scrolling the wheel rewrote the prompt.
+///
+/// `#{alternate_on}` is the question actually worth asking, and only `tmux`
+/// can answer it, because only `tmux` can see the inner program's screen
+/// state. So the branch lives here rather than in the app: an inline pane
+/// scrolls `tmux`'s history, a full-screen one gets the cursor key it always
+/// got. `copy-mode -e` exits itself at the bottom, so scrolling back down
+/// returns to the prompt with nothing to dismiss.
+///
+/// `set -g mouse on` would have let `tmux` do this from its own default
+/// binding, and was refused twice for two different reasons. It costs
+/// text selection, which `tmux` would take over from the terminal; and it
+/// hands the wheel to xterm.js's mouse-report path, which damps deltas under
+/// 50px by 0.3 and then sends one report however many lines it just computed
+/// — the two defects Marol's own wheel arithmetic exists to correct.
 pub const HOLD_CONF: &str = "\
 set -g status off
 set -g escape-time 0
@@ -75,6 +101,8 @@ set -g default-terminal \"screen-256color\"
 set -ga terminal-overrides \",*:Tc\"
 set -g destroy-unattached off
 unbind-key -a
+bind-key -T root M-PPage if-shell -F '#{alternate_on}' 'send-keys Up' 'copy-mode -e ; send-keys -X scroll-up'
+bind-key -T root M-NPage if-shell -F '#{alternate_on}' 'send-keys Down' 'if-shell -F \"#{pane_in_mode}\" \"send-keys -X scroll-down\" \"\"'
 ";
 
 /// Which socket, and how tmux is told about it.
@@ -642,6 +670,77 @@ mod hold_tests {
         // Truecolor survives the wrapping, or every themed TUI loses its
         // palette the moment a world gains tmux.
         assert!(HOLD_CONF.contains("*:Tc"));
+        // The wheel's two keys, and the branch that makes them right. An
+        // inline pane scrolls tmux's own history; a full-screen one gets the
+        // cursor key it always got, and only tmux can tell them apart.
+        assert!(HOLD_CONF.contains("M-PPage"), "the scroll-up key is gone");
+        assert!(HOLD_CONF.contains("M-NPage"), "the scroll-down key is gone");
+        assert!(HOLD_CONF.contains("alternate_on"), "the branch is gone");
+        // Selection stays the terminal's. Turning tmux's mouse on would take
+        // it, and would hand the wheel back to the damped mouse-report path.
+        assert!(HOLD_CONF.contains("set -g mouse off"));
+    }
+
+    /// The config is a string handed to somebody else's parser, so it is
+    /// checked against that parser rather than against our idea of it.
+    ///
+    /// Skipped where tmux is not installed — which is every Windows runner,
+    /// and the same reason a world without tmux holds nothing.
+    #[test]
+    fn tmux_accepts_the_hold_config_and_binds_both_wheel_keys() {
+        let Ok(tmux) = which_tmux() else {
+            eprintln!("skip: no tmux");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("marol-conf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let conf = dir.join("hold.conf");
+        std::fs::write(&conf, HOLD_CONF).expect("write conf");
+        let sock = format!("marolconf{}", std::process::id());
+
+        let run = |args: &[&str]| {
+            std::process::Command::new(&tmux)
+                .args(["-L", &sock])
+                .args(args)
+                .output()
+                .expect("tmux")
+        };
+        let started = std::process::Command::new(&tmux)
+            .args(["-L", &sock, "-f"])
+            .arg(&conf)
+            .args(["new-session", "-d", "-x", "80", "-y", "10", "sleep 20"])
+            .output()
+            .expect("tmux");
+        assert!(
+            started.status.success(),
+            "tmux refused the config: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+
+        let keys = run(&["list-keys", "-T", "root"]);
+        let listed = String::from_utf8_lossy(&keys.stdout).into_owned();
+        let _ = run(&["kill-server"]);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Both bound, and both still carrying the branch: a binding that
+        // parsed but lost its condition would scroll the wrong thing.
+        for key in ["M-PPage", "M-NPage"] {
+            let line = listed
+                .lines()
+                .find(|l| l.contains(key))
+                .unwrap_or_else(|| panic!("tmux did not bind {key}:\n{listed}"));
+            assert!(line.contains("alternate_on"), "{key} lost its branch: {line}");
+        }
+    }
+
+    fn which_tmux() -> Result<String, ()> {
+        for dir in std::env::var("PATH").unwrap_or_default().split(':') {
+            let p = std::path::Path::new(dir).join("tmux");
+            if p.is_file() {
+                return Ok(p.to_string_lossy().into_owned());
+            }
+        }
+        Err(())
     }
 
     /// The socket carries both the desk and the session. Without the desk,

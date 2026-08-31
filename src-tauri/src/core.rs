@@ -173,6 +173,15 @@ pub struct SessionMeta {
     /// Transient like the followup flag beside it — a chain does not survive
     /// the app, because neither do the terminals it ran through.
     pub relay_hops: u32,
+    /// Whether `tmux` is holding this session's process.
+    ///
+    /// The wheel needs it. A held pane is on the alternate screen from the
+    /// terminal's point of view the moment `tmux` attaches, whatever the
+    /// program inside is doing — so the app cannot tell an inline agent from
+    /// a full-screen one and must let `tmux` decide, which it can only be
+    /// asked to do when it is there. Transient: it describes a process, and
+    /// a restore in a world that has since lost `tmux` would be lying.
+    pub held: bool,
     /// The `$MAROL_PORT` a run script was handed, when the app can
     /// reach it (local and WSL; an SSH host's port lives on the remote).
     /// Transient like the followup flag: the server dies with the PTY, and
@@ -397,6 +406,7 @@ impl SessionMeta {
             has_followup: false,
             pending_from: Vec::new(),
             relay_hops: 0,
+            held: false,
             preview_port: None,
             usage: None,
             transcript_path: None,
@@ -2776,6 +2786,7 @@ impl Core {
             has_followup: false,
             pending_from: Vec::new(),
             relay_hops: 0,
+            held: false,
             preview_port: None,
             usage: None,
             transcript_path: None,
@@ -2949,6 +2960,7 @@ impl Core {
             has_followup: false,
             pending_from: Vec::new(),
             relay_hops: 0,
+            held: false,
             preview_port: None,
             usage: None,
             transcript_path: None,
@@ -3299,6 +3311,7 @@ impl Core {
             has_followup: false,
             pending_from: Vec::new(),
             relay_hops: 0,
+            held: false,
             // Reachable worlds only: local directly, WSL through mirrored
             // networking. An SSH host's port lives on the remote, and a
             // recorded port nobody can dial would put a preview button on
@@ -3436,6 +3449,7 @@ impl Core {
             has_followup: false,
             pending_from: Vec::new(),
             relay_hops: 0,
+            held: false,
             preview_port: None,
             usage: None,
             transcript_path: None,
@@ -4605,6 +4619,7 @@ impl Core {
             has_followup: false,
             pending_from: Vec::new(),
             relay_hops: 0,
+            held: false,
             preview_port: None,
             usage: None,
             transcript_path: None,
@@ -4841,6 +4856,12 @@ impl Core {
         // is useless for a WSL world, since a WSL world only exists on a
         // Windows host and there is no native Windows tmux to be the holder.
         let plan = self.hold_plan(&he, id);
+        // Recorded because the wheel has to know. Written here rather than
+        // derived from the world later: whether *this* launch was wrapped is
+        // the fact, and a world can gain or lose tmux between launches.
+        if let Some(s) = self.sessions.lock().unwrap().get_mut(id) {
+            s.held = plan.is_some();
+        }
         let (program, args) = match &plan {
             Some(p) => pty::hold_attach(&p.socket, &p.conf, Some(&loc.path), &program, &args),
             None => (program, args),
@@ -6734,6 +6755,7 @@ mod tests {
             has_followup: false,
             pending_from: Vec::new(),
             relay_hops: 0,
+            held: false,
             preview_port: None,
             usage: None,
             transcript_path: None,
