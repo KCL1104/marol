@@ -1076,6 +1076,32 @@ agent 不能替你批准任何東西，而這句話在 agent 讀到內容之前�
 看顧。抽屜從第一手就把深度顯示出來，所以你可以看著三變成五，在有東西被代替你
 拒絕之前先介入；而真的被擋下來的時候，卡片會說。
 
+**Codex 是走它自己的 hook 進來的，因為它沒有別條路。** Codex 會把交給 model 的
+shell 關進沙箱，而且只放行 `AF_UNIX` 這一個 socket family —— seccomp 過濾器只在
+第一個參數是 `AF_UNIX` 時允許 `socket()`，loopback 沒有例外。所以一個打向這張桌子
+的 `curl` 會在 `socket()` 裡面就失敗，而 model 看到連線錯誤，就會回報「桌子掛了」
+—— 它其實好好的。這不是靠打開沙箱來繞過的事：沙箱本來就是重點。
+
+通得過的那條路，是本來就在運作的那一條。Codex 的 *hook* 是它自己在跑的，在它自己的
+行程裡，在那個沙箱外面 —— 這正是為什麼一個 `curl` 出不去的 session，狀態卻照常回報
+—— 而 `PreToolUse` hook 會拿到 model 正要執行的那行指令。所以 model 把它想做的事
+寫成一個 shell 的 no-op：
+
+```bash
+: marol-peers
+: marol-send <對方的 id> <你的訊息>
+```
+
+沒有任何東西會執行它們；開頭那個冒號是 shell 的 no-op。Marol 從它本來每個指令都會
+收到的那個 hook 裡把這行讀出來，把事情做掉，然後用那個 hook 自己的
+`additionalContext` 回答，Codex 會把它記在對話上。進去一條路、出來一條路，兩條都不是
+model 被沒收的那種 socket。
+
+門底下是同一份程式：同一個佇列、同一個信封、同一條中繼天花板。不同的只有這個
+「請求是怎麼進來的」，以及隨之而來的驗證方式 —— 這條路上沒有 per-session token。
+它不需要：呼叫者是 Codex 自己的 hook 行程，它是用 hook URL 裡那個秘密連上監聽器的，
+而任何能偽造這個的東西，本來就已經能偽造狀態了。
+
 **每支 CLI 走自己那扇門學會它。** Claude Code 從 `--plugin-dir` 帶進去的
 plugin 裡讀一份 skill。Codex 沒有等價的 per-launch 機制 —— 它的 skill 住在
 `~/.codex/skills`，那是人自己的設定，這個 app 不寫進去 —— 所以它由自己的

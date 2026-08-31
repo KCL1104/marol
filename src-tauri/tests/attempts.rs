@@ -467,6 +467,40 @@ exec "$@"
         assert!(resp.starts_with("HTTP/1.1 200"), "hook was not answered: {resp}");
     }
 
+    /// The same post, keeping what came back.
+    ///
+    /// A `PreToolUse` hook's stdout is what Codex reads as the hook's answer,
+    /// and for a sandboxed session that body is the only way the desk can say
+    /// anything to the model. So the reply is the thing under test, not an
+    /// acknowledgement to be thrown away — which is what `hook` does with it.
+    fn hook_reply(&self, session_id: &str, state: &str, body: serde_json::Value) -> String {
+        use std::io::{Read as _, Write as _};
+        let url = self.core.hook_url().expect("hook listener");
+        let rest = url.trim_start_matches("http://");
+        let (addr, path) = rest.split_once('/').expect("url has a path");
+        let body = body.to_string();
+        let mut sock = std::net::TcpStream::connect(addr).expect("connect to the hook listener");
+        let req = format!(
+            "POST /{path}?state={state} HTTP/1.1\r\nHost: localhost\r\n\
+             X-Marol-Session: {session_id}\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        sock.write_all(req.as_bytes()).unwrap();
+        let mut resp = String::new();
+        let _ = sock.read_to_string(&mut resp);
+        let (head, out) = resp.split_once("\r\n\r\n").unwrap_or((resp.as_str(), ""));
+        assert!(head.starts_with("HTTP/1.1 200"), "hook was not answered: {resp}");
+        // What Codex would parse: the `additionalContext`, or nothing at all.
+        serde_json::from_str::<serde_json::Value>(out)
+            .ok()
+            .and_then(|v| {
+                v["hookSpecificOutput"]["additionalContext"]
+                    .as_str()
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| out.to_string())
+    }
+
     /// The timeline, once it has at least `at_least` rows. The writer runs on
     /// its own thread, so this is the honest way to read it.
     fn timeline(&self, attempt_id: &str, at_least: usize) -> Vec<crate::store::AttemptEvent> {
@@ -2092,6 +2126,95 @@ fn the_agent_update_switch_is_remembered() {
         !core2.agent_updates_on(),
         "a desk that was told not to update the agents did it anyway on the next start"
     );
+}
+
+/// The road a sandboxed session takes.
+///
+/// Codex denies the model's shell every socket family but `AF_UNIX`, so the
+/// `curl` the skill used to describe cannot be made at all — it fails inside
+/// `socket()`, and the model, seeing a connection error, reports this desk as
+/// down. But Codex runs its *hooks* itself, outside that sandbox, and a
+/// `PreToolUse` hook is handed the command the model was about to run. So the
+/// message rides out on the hook, and the answer comes back as that hook's
+/// own `additionalContext`.
+///
+/// Driven here the way Codex drives it: a `PreToolUse` payload carrying the
+/// command, with no send token anywhere — the hook's own URL is the secret,
+/// and the model never had a socket to put a token through.
+#[test]
+fn a_sandboxed_session_reaches_the_desk_through_its_own_hook() {
+    let h = Harness::new("relayhook");
+    let _guard = h.rt.enter();
+
+    let t1 = h.card("Fix login", "make it work");
+    let a1 = h.start(&t1, "claude");
+    h.launches(&a1.session_id, 1);
+    let t2 = h.card("Port the tests", "port them");
+    let a2 = h.start(&t2, "codex");
+    h.launches(&a2.session_id, 1);
+
+    // What the desk answers is what Codex hands back to the model, so the
+    // listing has to be in the body rather than merely acted upon.
+    let listing = h.hook_reply(
+        &a2.session_id,
+        "running",
+        serde_json::json!({ "tool_name": "shell", "tool_input": { "command": ": marol-peers" } }),
+    );
+    assert!(
+        listing.contains(&a1.session_id),
+        "the peer listing did not come back through the hook: {listing:?}"
+    );
+    assert!(
+        !listing.contains(&a2.session_id),
+        "a session was offered its own address: {listing:?}"
+    );
+
+    // And the send, addressed by the id that listing gave.
+    let sent = h.hook_reply(
+        &a2.session_id,
+        "running",
+        serde_json::json!({
+            "tool_name": "shell",
+            "tool_input": { "command": format!(": marol-send {} auth.py is mine", a1.session_id) },
+        }),
+    );
+    assert!(sent.contains("Delivered"), "the send was refused: {sent:?}");
+    // Named, because a sentence is the whole answer here — there is no HTTP
+    // status for the model to read.
+    assert!(sent.contains("Fix login"), "the answer does not say who got it: {sent:?}");
+
+    // It lands in the other session's terminal wearing the same frame the
+    // socket road puts on it: this road changed the door, not the message.
+    let stdin = h.stdin_when(&a1.session_id, |s| s.contains("auth.py is mine"));
+    assert!(stdin.contains("[marol]"), "the message wore no frame: {stdin:?}");
+    assert!(
+        stdin.contains("Not from the person"),
+        "the frame does not disclaim the person: {stdin:?}"
+    );
+    assert!(stdin.contains("Port the tests"), "the frame does not name the sender: {stdin:?}");
+}
+
+/// An ordinary tool call is left alone. This runs on every command a Codex
+/// session makes, so a loose match would turn somebody's work into a message
+/// — and an ordinary call must still get an empty body, because stdout from a
+/// hook is read as a decision about the tool call.
+#[test]
+fn an_ordinary_tool_call_is_not_read_as_a_message() {
+    let h = Harness::new("relayplain");
+    let _guard = h.rt.enter();
+    let task = h.card("Fix login", "make it work");
+    let a = h.start(&task, "claude");
+    h.launches(&a.session_id, 1);
+
+    let reply = h.hook_reply(
+        &a.session_id,
+        "running",
+        serde_json::json!({
+            "tool_name": "shell",
+            "tool_input": { "command": "git commit -m 'marol-send is not what this is'" },
+        }),
+    );
+    assert!(reply.trim().is_empty(), "an ordinary command got an answer: {reply:?}");
 }
 
 /// The brake on an unattended chain.

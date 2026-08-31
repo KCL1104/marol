@@ -934,6 +934,115 @@ impl Router {
         self.sink
             .emit("badge", serde_json::json!({ "count": waiting }));
     }
+
+    /// The peer listing, with no opinion about how the asker got here.
+    ///
+    /// Split from `on_peers` because there are two doors now and only one
+    /// of them carries a per-session token — see `on_relay`.
+    fn peers_of(&self, session_id: &str) -> Option<String> {
+        self.sessions.lock().unwrap().get(session_id)?;
+        let sessions = self.sessions.lock().unwrap();
+        let mut rows: Vec<String> = sessions
+            .values()
+            .filter(|s| s.id != session_id && s.live && s.agent_session)
+            .map(|s| format!("{}\t{}\t{}", s.id, s.title, status_name(s.status)))
+            .collect();
+        rows.sort();
+        Some(rows.join("\n") + if rows.is_empty() { "" } else { "\n" })
+    }
+
+    /// Put one session's message on another's queue.
+    ///
+    /// `Ok` carries the target's name, because one of the two doors has
+    /// to say who actually got it: an agent that cannot see an HTTP
+    /// status needs the sentence to be the whole answer.
+    fn deliver_peer(&self, session_id: &str, to: &str, text: &str) -> Result<String, String> {
+        if text.trim().is_empty() {
+            return Err("there was no message to carry".to_string());
+        }
+        if session_id == to {
+            return Err("a session cannot message itself".to_string());
+        }
+        let (from, hops, target_idle) = {
+            let sessions = self.sessions.lock().unwrap();
+            let sender = sessions
+                .get(session_id)
+                .ok_or_else(|| "the sending session is not on this desk".to_string())?;
+            let (from, hops) = (sender.title.clone(), sender.relay_hops + 1);
+            let target = sessions
+                .get(to)
+                .ok_or_else(|| format!("no session here with id {to}"))?;
+            if !target.live {
+                return Err(format!("「{}」 has no terminal any more", target.title));
+            }
+            (
+                from,
+                hops,
+                !matches!(target.status, Status::Running | Status::Starting),
+            )
+        };
+        // The brake. Refused before anything is queued or recorded, because a
+        // chain this long is not a message to hold for later — it is one that
+        // should not be sent at all, and saying so while the sender is still
+        // in its own turn is what lets it do something else instead.
+        if hops > MAX_RELAY_HOPS {
+            // Said on the card as well as to the sender. The agent will do
+            // something with the refusal, but what it does is its own turn's
+            // business; the person watching the board is the one who can
+            // actually end the deadlock, and they will not read the agent's
+            // transcript to find out that it wants them.
+            {
+                let mut sessions = self.sessions.lock().unwrap();
+                let to_title = sessions.get(to).map(|s| s.title.clone()).unwrap_or_default();
+                if let Some(sender) = sessions.get_mut(session_id) {
+                    sender.activity = Some(Activity {
+                        tool: "SendMessage".to_string(),
+                        detail: format!("→ {to_title}: held back, {hops} relays from a person"),
+                    });
+                    sender.activity_since = now_ms();
+                }
+            }
+            self.broadcast();
+            return Err(format!(
+                "this would be relay {hops} since a person last said anything, and this desk \
+                 stops at {MAX_RELAY_HOPS} — ask the person at the keyboard rather than \
+                 another agent. Anyone typing into either terminal clears the count."
+            ));
+        }
+        let core = self
+            .core
+            .get()
+            .and_then(|w| w.upgrade())
+            .ok_or_else(|| "this desk is shutting down".to_string())?;
+        core.enqueue_followup(to, text, Some(from), hops)
+            .map_err(|e| format!("{e:#}"))?;
+
+        // What the sender is doing, said the way the board already says it.
+        // A session posting to this endpoint is inside a shell tool, so its
+        // own PreToolUse reported `Bash` with a curl line — true, and useless
+        // on a card about which agents are talking to each other. Rewritten
+        // into the arrow shape `activity_from_payload` already gives Claude
+        // Code's own SendMessage, so the two channels read alike.
+        let to_title = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let to_title = sessions.get(to).map(|s| s.title.clone()).unwrap_or_default();
+            if let Some(sender) = sessions.get_mut(session_id) {
+                let what: String = text.chars().take(120).collect();
+                sender.activity = Some(Activity {
+                    tool: "SendMessage".to_string(),
+                    detail: format!("→ {to_title}: {what}").chars().take(160).collect(),
+                });
+                sender.activity_since = now_ms();
+            }
+            to_title
+        };
+        self.broadcast();
+
+        if target_idle {
+            core.flush_followup(to);
+        }
+        Ok(to_title)
+    }
 }
 
 impl PtySink for Router {
@@ -1179,14 +1288,7 @@ impl HookHandler for Router {
         if !self.token_ok(session_id, token) {
             return None;
         }
-        let sessions = self.sessions.lock().unwrap();
-        let mut rows: Vec<String> = sessions
-            .values()
-            .filter(|s| s.id != session_id && s.live && s.agent_session)
-            .map(|s| format!("{}\t{}\t{}", s.id, s.title, status_name(s.status)))
-            .collect();
-        rows.sort();
-        Some(rows.join("\n") + if rows.is_empty() { "" } else { "\n" })
+        self.peers_of(session_id)
     }
 
     /// One session writing to another.
@@ -1204,87 +1306,43 @@ impl HookHandler for Router {
         if !self.token_ok(session_id, token) {
             return Err("not this session's token".to_string());
         }
-        if session_id == to {
-            return Err("a session cannot message itself".to_string());
-        }
-        let (from, hops, target_idle) = {
-            let sessions = self.sessions.lock().unwrap();
-            let sender = sessions
-                .get(session_id)
-                .ok_or_else(|| "the sending session is not on this desk".to_string())?;
-            let (from, hops) = (sender.title.clone(), sender.relay_hops + 1);
-            let target = sessions
-                .get(to)
-                .ok_or_else(|| format!("no session here with id {to}"))?;
-            if !target.live {
-                return Err(format!("「{}」 has no terminal any more", target.title));
-            }
-            (
-                from,
-                hops,
-                !matches!(target.status, Status::Running | Status::Starting),
-            )
-        };
-        // The brake. Refused before anything is queued or recorded, because a
-        // chain this long is not a message to hold for later — it is one that
-        // should not be sent at all, and saying so while the sender is still
-        // in its own turn is what lets it do something else instead.
-        if hops > MAX_RELAY_HOPS {
-            // Said on the card as well as to the sender. The agent will do
-            // something with the refusal, but what it does is its own turn's
-            // business; the person watching the board is the one who can
-            // actually end the deadlock, and they will not read the agent's
-            // transcript to find out that it wants them.
-            {
-                let mut sessions = self.sessions.lock().unwrap();
-                let to_title = sessions.get(to).map(|s| s.title.clone()).unwrap_or_default();
-                if let Some(sender) = sessions.get_mut(session_id) {
-                    sender.activity = Some(Activity {
-                        tool: "SendMessage".to_string(),
-                        detail: format!("→ {to_title}: held back, {hops} relays from a person"),
-                    });
-                    sender.activity_since = now_ms();
+        self.deliver_peer(session_id, to, text).map(|_| ())
+    }
+
+    /// The same two asks, from a session that cannot open a socket.
+    ///
+    /// Codex sandboxes the shell it gives the model and denies it every
+    /// socket family but `AF_UNIX`, so the `curl` the skill describes
+    /// cannot be made at all — it fails inside `socket()`, and the model,
+    /// seeing a connection error, reports the desk as down. But Codex runs
+    /// its *hooks* itself, outside that sandbox, and a `PreToolUse` hook
+    /// is handed the command the model was about to run. So the model
+    /// writes what it wants as a shell no-op, and the hook — which can
+    /// reach us — carries it. The reply goes back as that hook's own
+    /// `additionalContext`, which Codex records on the conversation.
+    ///
+    /// No per-session token here, and that is not a hole: the caller is
+    /// the CLI's hook process, which reached this listener with the secret
+    /// in the hook URL. Anything able to forge this could already forge
+    /// status — and the model this exists for cannot open a socket.
+    fn on_relay(&self, session_id: &str, ask: &hooks::RelayAsk) -> String {
+        match ask {
+            hooks::RelayAsk::Peers => match self.peers_of(session_id) {
+                None => "[marol] This session is not on this desk any more.".to_string(),
+                Some(list) if list.trim().is_empty() => {
+                    "[marol] No other agent sessions are running on this desk.".to_string()
+                }
+                Some(list) => {
+                    format!("[marol] On this desk, as id<TAB>name<TAB>status:\n{list}")
+                }
+            },
+            hooks::RelayAsk::Send { to, text } => {
+                match self.deliver_peer(session_id, to, text) {
+                    Ok(name) => format!("[marol] Delivered to 「{name}」."),
+                    Err(why) => format!("[marol] Not delivered: {why}"),
                 }
             }
-            self.broadcast();
-            return Err(format!(
-                "this would be relay {hops} since a person last said anything, and this desk \
-                 stops at {MAX_RELAY_HOPS} — ask the person at the keyboard rather than \
-                 another agent. Anyone typing into either terminal clears the count."
-            ));
         }
-        let core = self
-            .core
-            .get()
-            .and_then(|w| w.upgrade())
-            .ok_or_else(|| "this desk is shutting down".to_string())?;
-        core.enqueue_followup(to, text, Some(from), hops)
-            .map_err(|e| format!("{e:#}"))?;
-
-        // What the sender is doing, said the way the board already says it.
-        // A session posting to this endpoint is inside a shell tool, so its
-        // own PreToolUse reported `Bash` with a curl line — true, and useless
-        // on a card about which agents are talking to each other. Rewritten
-        // into the arrow shape `activity_from_payload` already gives Claude
-        // Code's own SendMessage, so the two channels read alike.
-        {
-            let mut sessions = self.sessions.lock().unwrap();
-            let to_title = sessions.get(to).map(|s| s.title.clone()).unwrap_or_default();
-            if let Some(sender) = sessions.get_mut(session_id) {
-                let what: String = text.chars().take(120).collect();
-                sender.activity = Some(Activity {
-                    tool: "SendMessage".to_string(),
-                    detail: format!("→ {to_title}: {what}").chars().take(160).collect(),
-                });
-                sender.activity_since = now_ms();
-            }
-        }
-        self.broadcast();
-
-        if target_idle {
-            core.flush_followup(to);
-        }
-        Ok(())
     }
 
     /// A session saying what it should be called.

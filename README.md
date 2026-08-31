@@ -1308,6 +1308,38 @@ depth from the first relay, so you can watch three become five and step in
 before anything is refused on your behalf, and the card says so when a
 message is actually held back.
 
+**Codex reaches the desk through its own hook, because it cannot reach it any
+other way.** Codex sandboxes the shell it gives the model and denies it every
+socket family but `AF_UNIX` — the seccomp filter allows `socket()` only when
+the first argument is `AF_UNIX`, with no carve-out for loopback. So a `curl`
+to this desk fails inside `socket()`, and the model, seeing a connection
+error, reports the desk as down when it is running perfectly. That is not a
+thing to work around by opening the sandbox: the sandbox is the point.
+
+The way through is the one channel that already works. Codex runs its *hooks*
+itself, in its own process, outside that sandbox — which is exactly why status
+keeps arriving from a session whose own `curl` cannot leave the ground — and a
+`PreToolUse` hook is handed the command the model was about to run. So the
+model writes what it wants as a shell no-op:
+
+```bash
+: marol-peers
+: marol-send <the id> <the message>
+```
+
+Nothing executes those; the leading colon is the shell's no-op. Marol reads
+the line out of the hook it already receives for every command, does the work,
+and answers in that hook's own `additionalContext`, which Codex records on the
+conversation. One road in, one road out, neither of them a socket the model
+was denied.
+
+Below the door it is the same code: the same queue, the same envelope, the
+same relay ceiling. What differs is only how the ask arrived — and with it the
+authentication, because there is no per-session token on this road. There does
+not need to be: the caller is Codex's own hook process, which reached the
+listener using the secret in the hook URL, and anything able to forge that
+could already forge status.
+
 **Each CLI learns it through its own door.** Claude Code reads a skill out of
 the plugin `--plugin-dir` carries. Codex has no per-launch equivalent — its
 skills live in `~/.codex/skills`, the person's own configuration, which this
