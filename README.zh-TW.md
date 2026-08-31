@@ -462,9 +462,20 @@ app 裡顯示這份清單：
 滑鼠滾一格會發生什麼，由畫面上那個 agent 決定，只有三種。在 normal buffer
 上它捲動這個 pane 自己的 10k scrollback，一個 byte 都不會送給程式。開了
 mouse tracking 就變成一則 mouse report，由程式自己捲。在 **alternate**
-buffer 上沒有 scrollback 可捲，所以 xterm.js 把滾輪轉成方向鍵、讓程式自己
-處理 —— 而每一個被 tmux 握住的 agent 都住在那裡，因為 tmux 一 attach 就送
-`smcup`。
+buffer 上終端機自己沒有東西可捲，所以滾輪變成方向鍵、讓程式自己處理 ——
+而每一個被 tmux 握住的 agent 都住在那裡，因為 tmux 一 attach 就送 `smcup`。
+
+**但那是誰的 alternate buffer。** 上面那句話以前就到此為止，而那個結尾是錯的：
+這個 pane 在 alternate screen 上，是因為 **tmux** 在上面；至於 tmux **裡面**
+那支程式在做什麼，是另一個問題。Codex 的對話是 inline 畫的 —— 它的 alternate
+screen 留給 Ctrl+T 那種疊層 —— 所以它的歷史躺在 **tmux 自己的 scrollback** 裡，
+方向鍵到不了。方向鍵真正到得了的是 Codex 的輸入框，而它把上下讀成「走一遍 prompt
+history」。滾輪看起來在改寫你的提示詞，因為它確實就是在做這件事。
+
+只有 tmux 看得到裡面那支程式的螢幕狀態，所以只有 tmux 分得出來。Marol 的設定
+綁了兩顆鍵交給它 —— 由 `#{alternate_on}` 決定是捲 tmux 的歷史還是把方向鍵轉發
+出去 —— 而一格滾輪值幾行就送幾次。`copy-mode -e` 到底部會自己退出，所以往回捲
+到底就回到提示字元，沒有東西要你去關掉。
 
 想法是對的，xterm.js 的算術不對。它算出一格值幾行，然後只送一行；而且把小於
 50px 的 pixel delta 當「大概是觸控板」乘以 0.3 再向下取整到整格 —— 以 ~17px
@@ -473,10 +484,12 @@ buffer 上沒有 scrollback 可捲，所以 xterm.js 把滾輪轉成方向鍵、
 
 所以算術改成 Marol 自己的：不足一行的 delta 跨事件累積，直到夠一行為止；一格
 送它該送的行數。兩種情況原封交還給 xterm.js —— 自己要了 wheel report 的程式
-擁有自己的滾輪，而 normal buffer 有真的 scrollback，該動的是 viewport。tmux
-那邊什麼都沒改：`set -g mouse on` 評估過後否決，因為在 alternate screen 上
-tmux 自己的綁定本來就是轉發，買不到東西，卻要賠掉「tmux 永不畫任何一格」
-這個承諾。
+擁有自己的滾輪，而 normal buffer 有真的 scrollback，該動的是 viewport。
+
+`set -g mouse on` 可以讓 tmux 從它自己的預設綁定走到同一個分支，仍然否決，但
+現在是兩個理由而不是那個錯的：它會把文字選取從終端機手上拿走；而且它把滾輪交
+回 xterm.js 的 mouse-report 路徑，那條路徑把小於 50px 的 delta 乘以 0.3，然後
+不管剛算出幾行都只送一則回報 —— 正是上面那套算術存在要修正的兩個缺陷。
 
 ### 螢幕閱讀器
 

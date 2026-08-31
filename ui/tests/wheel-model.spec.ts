@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { DELTA_LINE, DELTA_PAGE, DELTA_PIXEL, wheelSequence, wheelStep } from '../src/wheel';
+import { DELTA_LINE, DELTA_PAGE, DELTA_PIXEL, tmuxScrollSequence, wheelSequence, wheelStep } from '../src/wheel';
 
 /** A 17px cell in a 40-row pane — the shape a real pane actually has. */
 const CELL = 17;
@@ -88,5 +88,41 @@ test.describe('the wheel, on the alternate buffer', () => {
     expect(wheelSequence(-1, false)).toBe('\x1b[A');
     expect(wheelSequence(0, false)).toBe('');
     expect(wheelSequence(0, true)).toBe('');
+  });
+});
+
+/**
+ * A held pane's notch goes to `tmux`, not to the program.
+ *
+ * The cursor keys are right only when nothing is in the way. Under `tmux` the
+ * pane is on the alternate buffer from the moment it attaches, whatever the
+ * program inside is doing — so an inline agent like Codex takes the Up key in
+ * its composer and walks prompt history, which is precisely what the wheel
+ * looked like it was doing. `tmux` is the only party that can see the inner
+ * screen state, so the notch is handed to it and its config branches.
+ */
+test.describe('the wheel, on a pane tmux is holding', () => {
+  test('a notch becomes the key tmux binds, one per line', () => {
+    // CSI 5;3~ / CSI 6;3~ — PageUp/PageDown with Alt, which tmux reads as
+    // M-PPage and M-NPage.
+    expect(tmuxScrollSequence(-1)).toBe('\x1b[5;3~');
+    expect(tmuxScrollSequence(1)).toBe('\x1b[6;3~');
+    expect(tmuxScrollSequence(-3)).toBe('\x1b[5;3~'.repeat(3));
+    expect(tmuxScrollSequence(4)).toBe('\x1b[6;3~'.repeat(4));
+  });
+
+  test('no movement sends nothing', () => {
+    // The carry still has to be able to swallow a notch without the pane
+    // twitching, exactly as on the cursor-key path.
+    expect(tmuxScrollSequence(0)).toBe('');
+  });
+
+  test('it is not the cursor keys, whatever DECCKM says', () => {
+    // The whole point: these must not be confusable with Up/Down, or they
+    // land in the composer again.
+    for (const app of [true, false]) {
+      expect(tmuxScrollSequence(-1)).not.toBe(wheelSequence(-1, app));
+      expect(tmuxScrollSequence(1)).not.toBe(wheelSequence(1, app));
+    }
   });
 });

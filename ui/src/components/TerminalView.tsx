@@ -8,7 +8,7 @@ import { api } from '../api';
 import { useT } from '../i18n';
 import { TERM_SR_EVENT, termSrEnabled } from '../termSr';
 import { xtermTheme } from '../theme';
-import { wheelSequence, wheelStep } from '../wheel';
+import { tmuxScrollSequence, wheelSequence, wheelStep } from '../wheel';
 
 /** base64 -> bytes. The PTY sends bytes so xterm's own UTF-8 decoder can
  *  stitch multi-byte characters that straddle a read boundary. */
@@ -36,16 +36,23 @@ export function TerminalView({
   id,
   visible,
   focused = true,
+  held = false,
 }: {
   id: string;
   visible: boolean;
   /** Only the focused pane takes keystrokes and blinks its cursor. */
   focused?: boolean;
+  /** Whether `tmux` is holding this session — see the wheel handler. */
+  held?: boolean;
 }) {
   const t = useT();
   const hostRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  /** Read through a ref because the wheel handler is attached once, on mount,
+      and a world can gain tmux between one launch and the next. */
+  const heldRef = useRef(held);
+  heldRef.current = held;
   const searchRef = useRef<SearchAddon | null>(null);
   /** The find bar, and whether the last search came up empty — the input
       wears that state rather than failing silently. */
@@ -137,7 +144,14 @@ export function TerminalView({
       const cell = term.element ? term.element.clientHeight / term.rows : 0;
       const step = wheelStep(ev.deltaY, ev.deltaMode, cell, term.rows, carry.lines);
       carry.lines = step.carry;
-      const seq = wheelSequence(step.lines, term.modes.applicationCursorKeysMode);
+      // Whose scrollback is it? A held pane's belongs to `tmux`, and only
+      // `tmux` can see whether the program inside is drawing inline or
+      // full-screen — so the notch goes to `tmux` as the key its config
+      // binds, and it decides. Unheld, nothing is in the way and the cursor
+      // keys reach the program directly, which is what they were always for.
+      const seq = heldRef.current
+        ? tmuxScrollSequence(step.lines)
+        : wheelSequence(step.lines, term.modes.applicationCursorKeysMode);
       // Consumed either way: a notch that only added to the carry must not
       // fall through and scroll the page behind the terminal.
       ev.preventDefault();

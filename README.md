@@ -553,10 +553,33 @@ sending a review batch gives the caret back to the diff.
 A wheel notch over a pane does one of three things, and the agent on screen
 decides which. On the normal buffer it scrolls the pane's own 10k scrollback
 and no bytes reach the program. Under mouse tracking it becomes a mouse report
-and the program scrolls itself. On the **alternate** buffer there is no
-scrollback to move, so xterm.js converts the wheel into cursor keys and lets
-the program do the scrolling — which is where every held agent lives, because
+and the program scrolls itself. On the **alternate** buffer there is nothing
+for the terminal itself to move, so the wheel becomes cursor keys and the
+program does the scrolling — which is where every held agent lives, because
 `tmux` emits `smcup` the moment it attaches.
+
+**Whose alternate buffer, though.** That last sentence used to end the matter
+and it was the wrong end: the pane is on the alternate screen because `tmux`
+is, and what the program *inside* `tmux` is doing is a separate question.
+Codex draws its conversation inline — its alternate screen is reserved for
+overlays like the Ctrl+T transcript — so its history is sitting in `tmux`'s
+own scrollback, where a cursor key cannot reach it. What the key reaches
+instead is Codex's composer, which reads Up and Down as a walk through prompt
+history. The wheel appeared to rewrite the prompt, and that is exactly what it
+was doing.
+
+Only `tmux` can see the inner program's screen state, so only `tmux` can make
+the distinction. Marol's config binds two keys to it — `#{alternate_on}`
+picks between scrolling `tmux`'s history and forwarding the cursor key — and a
+notch sends one of those keys per line it is worth. `copy-mode -e` exits
+itself at the bottom, so scrolling back down leaves nothing to dismiss.
+
+`set -g mouse on` would let `tmux` reach the same branch from its own default
+binding, and is still refused, now for two reasons rather than the one that
+was wrong. It would take text selection away from the terminal; and it hands
+the wheel to xterm.js's mouse-report path, which damps deltas under 50px by
+0.3 and then sends a single report however many lines it just computed — the
+two defects the arithmetic below exists to correct.
 
 The idea is right; xterm.js's arithmetic was not. It computes how many lines a
 notch is worth and then sends exactly one, and it damps pixel deltas under
@@ -569,10 +592,7 @@ So the arithmetic is Marol's: sub-line deltas accumulate across events until
 they are worth a line, and a notch sends the lines it is worth. Two cases are
 handed straight back to xterm.js — a program that asked for wheel reports owns
 its own wheel, and the normal buffer has a real scrollback that the viewport
-should move. Nothing about `tmux` changes: `set -g mouse on` was considered and
-refused, because on the alternate screen `tmux`'s own binding forwards the
-event anyway, so it buys nothing and costs the promise that `tmux` never draws
-a cell.
+should move.
 
 ### Screen readers
 

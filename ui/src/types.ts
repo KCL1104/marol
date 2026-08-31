@@ -170,6 +170,11 @@ export interface SessionMeta {
       typing into the terminal puts it back there. Transient, like the queue
       it is counted from. */
   relay_hops?: number;
+  /** Whether `tmux` is holding this session's process. The wheel needs it:
+      a held pane is on the alternate buffer whatever the program inside is
+      doing, so only `tmux` can tell an inline agent from a full-screen one.
+      Transient, like the rest of a running process's facts. */
+  held?: boolean;
   /** The $MAROL_PORT a run script was handed, when reachable from the
       app (local and WSL; an SSH host's port lives on the remote). Transient
       — the server dies with the PTY. */

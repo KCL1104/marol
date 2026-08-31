@@ -179,7 +179,12 @@ export function Pane({
           ✕
         </button>
       </div>
-      <TerminalView id={session.id} visible={visible} focused={focused} />
+      <TerminalView
+        id={session.id}
+        visible={visible}
+        focused={focused}
+        held={session.held ?? false}
+      />
 
       {/* Which half lights up is the only signal that says "this will split
           here" rather than "this will swap". */}
