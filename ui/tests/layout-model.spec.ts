@@ -6,12 +6,14 @@ import {
   dropOn,
   dropOnRoot,
   encodeDrag,
+  formatLayout,
   geometry,
   isSplit,
   leaves,
   materialise,
   MIN_TRACK,
   normalize,
+  parseLayout,
   reconcileTree,
   removeLeaf,
   zoneAt,
@@ -238,5 +240,33 @@ test.describe('auto columns', () => {
 
   test('an explicit column count overrides the width', () => {
     expect(autoCols({ mode: 'auto', cols: 3 }, 1010, 6)).toBe(3);
+  });
+
+  /**
+   * A wall wider than three.
+   *
+   * Three was a picker constant with nothing behind it — the model has always
+   * been able to draw more, and `autoCols` bounds the answer by the number of
+   * panes rather than by any number of ours. So the only real ceiling is one
+   * column per pane, and asking for more than that is asking for the same
+   * arrangement by another name.
+   */
+  test('a wall can be as wide as it has panes', () => {
+    expect(autoCols({ mode: 'auto', cols: 8 }, 1010, 8)).toBe(8);
+    expect(autoCols({ mode: 'auto', cols: 12 }, 1010, 12)).toBe(12);
+    // And past that it saturates rather than drawing empty tracks.
+    expect(autoCols({ mode: 'auto', cols: 12 }, 4000, 5)).toBe(5);
+  });
+
+  /** A stored count survives the round trip it used to be clipped by. */
+  test('a stored column count past the old ceiling is kept', () => {
+    expect(parseLayout(formatLayout({ mode: 'auto', cols: 10 }))).toEqual({
+      mode: 'auto',
+      cols: 10,
+    });
+    // Still not a place to put nonsense: a corrupt row reads as one column,
+    // which is the arrangement that can always be drawn.
+    expect(parseLayout('{"mode":"auto","cols":-4}')).toEqual({ mode: 'auto', cols: 1 });
+    expect(parseLayout('{"mode":"auto","cols":"lots"}')).toEqual({ mode: 'auto', cols: 1 });
   });
 });

@@ -1312,7 +1312,9 @@ export default function App() {
               {t('view.inspector')}
             </button>
           )}
-          {view === 'terminal' && <ColumnPicker layout={layout} onPick={onPickCols} />}
+          {view === 'terminal' && (
+            <ColumnPicker layout={layout} panes={members.length} onPick={onPickCols} />
+          )}
           <div
             className="view-toggle"
             role="tablist"
