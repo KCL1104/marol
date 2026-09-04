@@ -2315,6 +2315,48 @@ fn a_relayed_paste_does_not_pass_for_somebody_typing() {
     assert_eq!(depth, 1, "the paste that delivered a relay counted as a person");
 }
 
+/// The other direction, which nothing covered.
+///
+/// Every bridge test until now sent codex -> claude. The roads are not
+/// symmetric — a sandboxed Codex reaches the desk through its own hook while
+/// Claude Code posts to the listener — but *delivery* is one path for both,
+/// and a direction nobody exercised is a direction nobody can vouch for.
+#[test]
+fn a_claude_session_can_message_a_codex_session() {
+    let h = Harness::new("bridgeback");
+    let _guard = h.rt.enter();
+
+    let t1 = h.card("Fix login", "make it work");
+    let a1 = h.start(&t1, "claude");
+    let claude = h.launches(&a1.session_id, 1);
+    let t2 = h.card("Port the tests", "port them");
+    let a2 = h.start(&t2, "codex");
+    h.launches(&a2.session_id, 1);
+
+    // Claude sees the codex session on its own listing.
+    let (status, listing) = get(&claude[0].peers_url);
+    assert!(status.contains("200"), "peers refused: {status}");
+    assert!(
+        listing.contains(&a2.session_id),
+        "the codex session is not on claude's list: {listing:?}"
+    );
+
+    let (status, reply) = post(
+        &claude[0].send_url,
+        &[("X-Marol-To", &a2.session_id)],
+        "the login fix landed; rebase before you touch session.py",
+    );
+    assert!(status.contains("200"), "send refused: {status} {reply}");
+
+    // And it reaches the codex terminal, framed the same way.
+    let stdin = h.stdin_when(&a2.session_id, |s| s.contains("rebase before you touch"));
+    assert!(stdin.contains("[marol]"), "the message wore no frame: {stdin:?}");
+    assert!(
+        stdin.contains("Fix login"),
+        "the frame does not name the sender: {stdin:?}"
+    );
+}
+
 /// A person's own follow-up is still the person's. The queue carries both
 /// kinds now, and the row each one leaves has to say which it was.
 #[test]

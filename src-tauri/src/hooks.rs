@@ -1131,7 +1131,7 @@ this session started.
 /// better than inventing a number beside a measured one.
 const PEERS_SKILL: &str = r#"---
 name: message-another-session
-description: Send a message to another agent session running beside this one on the same Marol desk, and list which sessions those are. Use when work here depends on, blocks, or duplicates work another session is doing — not to chat.
+description: Send a message to another agent session running beside this one on the same Marol desk, and list which sessions those are. Use this rather than your own session-messaging tool, which cannot see or address sessions belonging to a different CLI. Use when work here depends on, blocks, or duplicates work another session is doing — not to chat.
 ---
 
 # Message another session
@@ -1139,6 +1139,18 @@ description: Send a message to another agent session running beside this one on 
 This session runs in a Marol window beside other agents, some of which may be
 a different CLI entirely. Each has a row on the person's board, an id, and a
 terminal of its own.
+
+## Not the same as your own session messaging
+
+You may also have a built-in tool for messaging sessions. That one reaches
+other sessions of *your own CLI*, on this machine. This desk is wider than
+that: the session you want may be a Codex session, or a session in a WSL
+distro or on an SSH host, and your own tool can neither list it nor deliver
+to it — it will report no such session, or quietly reach nobody.
+
+So the rule is simple. Anything on this board is addressed here, by the id
+this skill's listing gives. Reach for your own tool only for a session this
+listing does not show.
 
 ## Who else is here
 
@@ -1213,6 +1225,36 @@ fn write_plugin(dir: &Path, url: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The skill has to say which road reaches which session.
+    ///
+    /// Claude Code has a session-messaging tool of its own, and it reaches
+    /// only other Claude Code sessions on this machine. A desk is wider than
+    /// that — a Codex session, a session in a WSL distro — so a skill that
+    /// merely offered a second way to do a thing the model already has a tool
+    /// for would lose every time the target was not another Claude. Codex has
+    /// no such tool and so was never confused; that asymmetry is exactly what
+    /// made the bridge look one-directional.
+    #[test]
+    fn the_skill_says_why_the_cli_own_messaging_is_not_this() {
+        let skill = super::PEERS_SKILL;
+        // In the description, because that is the text a model reads when it
+        // is deciding whether this skill applies at all.
+        let description = skill
+            .lines()
+            .find(|l| l.starts_with("description:"))
+            .expect("a description");
+        assert!(
+            description.contains("own session-messaging tool"),
+            "the description does not distinguish the two roads: {description}"
+        );
+        // And in the body, with the reason rather than only the instruction.
+        assert!(skill.contains("your own session messaging"), "{skill}");
+        assert!(
+            skill.contains("Codex session"),
+            "the body does not name the case that fails: {skill}"
+        );
+    }
 
     /// The shape a sandboxed session writes, and what is read back out of it.
     ///
